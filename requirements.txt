@@ -1,7 +1,7 @@
 # 延續 v5 已成功部署的主要版本，不需另裝 mediapipe-hands
 streamlit
-opencv-python-headless
 mediapipe==0.10.21
-numpy<2.0.0
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
 pandas
 Pillow
