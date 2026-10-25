@@ -44,6 +44,8 @@ import logging
 import base64
 import tempfile
 import time
+import json
+import re
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
@@ -51,9 +53,9 @@ from PIL import Image, ImageDraw, ImageFont
 # Complexity 2 asks MediaPipe to download pose_landmark_heavy.tflite into site-packages,
 # which is typically read-only on hosted deployments.
 POSE_MODEL_COMPLEXITY = 1
-APP_BUILD_TAG = "RULA_V6_POSE_HAND_EXPERIMENT_2026-10-25"
+APP_BUILD_TAG = "RULA_V7_WRIST_QC_TABBED_2026-10-25"
 
-# ==================== 【正統 RULA 查表矩陣】 ====================
+# ==================== 【沿用 v6 RULA 查表矩陣：仍需標準工作表逐格核對】 ====================
 TABLE_A = {
     1: { 1: {1: {1:1, 2:2}, 2: {1:2, 2:2}, 3: {1:2, 2:3}, 4: {1:3, 2:3}},
          2: {1: {1:2, 2:2}, 2: {1:2, 2:3}, 3: {1:3, 2:3}, 4: {1:3, 2:4}},
@@ -292,54 +294,101 @@ def _landmark_xy(landmarks, width, height):
 
 
 def extract_hand_comparison(hand_results, shape, pose_wrist, opposite_wrist, pose_elbow):
-    """與 Pose 在相同圖片的 2D 座標匹配；Hand World 只計算手內部局部幾何。"""
+    """Same-frame image-space comparison only; never subtract Pose World and Hand World.
+
+    Matched indicates hand-to-wrist association, NOT anatomical accuracy.
+    Hand World values are local palm descriptors only.
+    """
     empty = {"matched": False, "reason": "未偵測到可匹配的目標手", "angle_2d": float("nan"),
-             "distance_ratio": float("nan"), "hand_world_palm_length": float("nan"),
+             "distance_ratio": float("nan"), "other_hand_margin_ratio": float("nan"),
+             "palm_forearm_ratio": float("nan"), "hand_world_palm_length": float("nan"),
              "hand_world_palm_spread_deg": float("nan"), "handedness": "", "hand_points": None}
     if hand_results is None or not getattr(hand_results, "hand_landmarks", None):
         return empty
     height, width = shape[:2]
     arm_len = float(np.linalg.norm(pose_wrist - pose_elbow))
-    if arm_len < 15.0:
-        return {**empty, "reason": "Pose 前臂太短／偵測不可靠"}
+    if not np.isfinite(arm_len) or arm_len < 15.0:
+        return {**empty, "reason": "Pose 前臂過短或關節定位不可靠"}
     options = []
     for i, hand in enumerate(hand_results.hand_landmarks):
         if len(hand) < 21:
             continue
         xy = _landmark_xy(hand, width, height)
-        ratio = float(np.linalg.norm(xy[0] - pose_wrist) / arm_len)
-        other_dist = float(np.linalg.norm(xy[0] - opposite_wrist)) if opposite_wrist is not None else float("inf")
+        if not np.all(np.isfinite(xy)):
+            continue
         target_dist = float(np.linalg.norm(xy[0] - pose_wrist))
-        options.append((ratio, other_dist, target_dist, i, xy))
+        other_dist = float(np.linalg.norm(xy[0] - opposite_wrist)) if opposite_wrist is not None else float("inf")
+        options.append((target_dist / arm_len, other_dist, target_dist, i, xy))
     if not options:
         return empty
     ratio, other_dist, target_dist, i, xy = min(options, key=lambda x: x[0])
-    # 不單憑 Hand handedness: 前鏡頭鏡像、人物轉身時 Left/Right 標籤可能不同。
+    margin_ratio = (other_dist - target_dist) / arm_len if np.isfinite(other_dist) else float("nan")
+    # One must not silently substitute the opposite hand. A small positive margin
+    # may be geometrically ambiguous and is rejected at scoring-quality stage.
     if ratio > 0.42 or (other_dist + 8 < target_dist):
-        return {**empty, "distance_ratio": round(ratio, 3), "reason": "手腕與目標 Pose 手腕不吻合"}
-    palm_center = np.mean(xy[[5, 9, 13, 17]], axis=0)
+        return {**empty, "distance_ratio": round(ratio, 3),
+                "other_hand_margin_ratio": round(margin_ratio, 3) if np.isfinite(margin_ratio) else np.nan,
+                "reason": "Hand 腕點未對應目標 Pose 手腕"}
+    palm_center = xy[[5, 9, 13, 17]].mean(axis=0)
     palm_len = float(np.linalg.norm(palm_center - xy[0]))
-    if palm_len < 7:
-        return {**empty, "distance_ratio": round(ratio, 3), "reason": "手掌像素長度不足"}
+    palm_ratio = palm_len / arm_len
+    if palm_len < 8:
+        return {**empty, "distance_ratio": round(ratio, 3), "palm_forearm_ratio": round(palm_ratio, 3),
+                "reason": "掌長像素不足"}
     angle = float(abs(180.0 - calculate_2d_angle(pose_elbow, xy[0], palm_center)))
     if not np.isfinite(angle):
-        return {**empty, "distance_ratio": round(ratio, 3), "reason": "手部角度幾何無效"}
-    world_length = float("nan")
-    world_spread = float("nan")
+        return {**empty, "distance_ratio": round(ratio, 3), "reason": "手部角度計算無效"}
+    world_length, world_spread = float("nan"), float("nan")
     world_hands = getattr(hand_results, "hand_world_landmarks", [])
     if i < len(world_hands) and len(world_hands[i]) >= 21:
         w3 = np.asarray([[float(z.x), float(z.y), float(z.z)] for z in world_hands[i]])
-        world_center = w3[[5, 9, 13, 17]].mean(axis=0)
-        world_length = float(np.linalg.norm(world_center - w3[0]))
-        world_spread = calculate_3d_angle(w3[5], w3[0], w3[17])
+        if np.all(np.isfinite(w3)):
+            world_center = w3[[5, 9, 13, 17]].mean(axis=0)
+            world_length = float(np.linalg.norm(world_center - w3[0]))
+            world_spread = calculate_3d_angle(w3[5], w3[0], w3[17])
     handed = getattr(hand_results, "handedness", [])
     label = ""
     if i < len(handed) and handed[i]:
         label = str(getattr(handed[i][0], "category_name", ""))
     return {"matched": True, "reason": "", "angle_2d": angle,
-            "distance_ratio": round(ratio, 3), "hand_world_palm_length": world_length,
+            "distance_ratio": round(ratio, 3),
+            "other_hand_margin_ratio": round(margin_ratio, 3) if np.isfinite(margin_ratio) else float("nan"),
+            "palm_forearm_ratio": round(palm_ratio, 3),
+            "hand_world_palm_length": world_length,
             "hand_world_palm_spread_deg": world_spread,
             "handedness": label, "hand_points": xy.tolist()}
+
+
+def evaluate_hand_geometry(hand, pose_2d_angle, pose_wrist_visibility, pose_elbow_visibility):
+    """Conservative engineering plausibility check, NOT probability or validated accuracy."""
+    problems = []
+    if not hand.get("matched"):
+        return False, [hand.get("reason", "沒有目標手")]
+    angle = float(hand.get("angle_2d", np.nan))
+    ratio = float(hand.get("distance_ratio", np.nan))
+    palm_ratio = float(hand.get("palm_forearm_ratio", np.nan))
+    margin = float(hand.get("other_hand_margin_ratio", np.nan))
+    if not np.isfinite(angle) or angle > 65:
+        problems.append("Hand 2D 角度極端或無效")
+    if not np.isfinite(ratio) or ratio > 0.22:
+        problems.append("兩模型手腕位置距離偏大")
+    if not np.isfinite(palm_ratio) or not 0.12 <= palm_ratio <= 0.85:
+        problems.append("手掌與前臂尺度比例不合理")
+    if np.isfinite(margin) and margin < 0.12:
+        problems.append("左右手空間匹配不明確")
+    if pose_wrist_visibility < 0.50 or pose_elbow_visibility < 0.50:
+        problems.append("Pose 手肘／腕點可見度偏低")
+    if not np.isfinite(pose_2d_angle) or abs(angle - pose_2d_angle) > 20:
+        problems.append("Hand 2D 與 Pose 2D 差異較大")
+    return len(problems) == 0, problems
+
+
+def make_pose_keypoint_snapshot(landmarks, width, height, indices):
+    """Image pixel coordinates + visibility for later independent diagnosis."""
+    return {str(i): {"x_px": round(float(landmarks[i].x * width), 2),
+                     "y_px": round(float(landmarks[i].y * height), 2),
+                     "visibility": round(float(getattr(landmarks[i], "visibility", 0.0)), 4)}
+            for i in indices}
 
 
 def draw_hand_overlay(pose_bgr, hand_points, hand_angle=None):
@@ -378,6 +427,42 @@ def _save_hand_photo(side, sample_id, sec, pose_jpeg, overlay_jpeg, zip_hand_ima
     tag = "Right" if side == "右手側" else "Left"
     zip_hand_images.append((f"Hand_Comparison/{tag}/Sample_{sample_id:03d}_{sec}s_Pose.jpg", pose_jpeg))
     zip_hand_images.append((f"Hand_Comparison/{tag}/Sample_{sample_id:03d}_{sec}s_PoseHand.jpg", overlay_jpeg))
+
+ANGLE_DEFINITIONS = ("RULA v7 角度說明\n"
+    "上臂: 評估側肩點到肘點相對投影軀幹方向的 2D 角度。\n"
+    "前臂: 180° - 肩(評估側)／肘／腕在影像上的夾角。\n"
+    "軀幹: 雙肩中心與雙髖中心連線相對影像垂直向上的投影角度，可能超過 90°。\n"
+    "頸部: 頭部代理點相對肩髖軸的 2D 角度，不是臨床頸椎解剖角。\n"
+    "Pose2D: Pose 肘、腕、食指／小指掌部代理點的 2D 角度。\n"
+    "Pose3D: Pose 模型世界座標的 3D 角度，可能受模型深度推論影響。\n"
+    "Pose混合: Pose2D*0.6+Pose3D*0.4（原版演算法，保留供比較）。\n"
+    "Hand2D: 同張影像 Pose 肘 + Hand 腕／掌指方向的投影角度。\n"
+    "HandWorld: 只用於手掌局部量測，並未與 Pose World 做 3D 座標融合。\n"
+    "品質門檻僅為工程篩檢，不能視為實際角度準確率。\n"
+    "RULA 查表矩陣保留既有版本，尚待標準工作表逐格獨立驗證。\n")
+
+
+def safe_json_value(value):
+    if isinstance(value, (np.floating, float)) and not np.isfinite(value):
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(type(value).__name__)
+
+
+def clean_json(obj):
+    # Recursively eliminate NaN; JSONL conforms to strict JSON, not NaN extensions.
+    if isinstance(obj, dict):
+        return {k: clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [clean_json(v) for v in obj]
+    if isinstance(obj, (np.floating, float)) and not np.isfinite(obj):
+        return None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
 
 # ==================== 【姿態偵測重試與關鍵點品質檢查】 ====================
 # Visibility 是模型對關鍵點可見性的估計，不是臨床級準確率。
@@ -805,9 +890,11 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         key_vis = _visibility_values(results, required)
         conf_side = float(np.mean(key_vis) * 100.0) if key_vis else 0.0
 
-        # 軀幹中心用雙肩／雙髖加權，耳朵選可見度較高的一側。
-        sh = pt2d(t_sh) * 0.65 + pt2d(o_sh) * 0.35
-        hp = pt2d(t_hp) * 0.65 + pt2d(o_hp) * 0.35
+        # 肩關節與前臂角度使用「評估側真實肩點」，避免雙肩加權造成關節頂點偏移。
+        # 軀幹與頭頸則用肩／髖中心估算影像投影；不能當作解剖學脊椎角度。
+        sh, hp = pt2d(t_sh), pt2d(t_hp)
+        sh_center = (pt2d(t_sh) + pt2d(o_sh)) * 0.5
+        hp_center = (pt2d(t_hp) + pt2d(o_hp)) * 0.5
         ear = pt2d(t_ear) if n_lm[t_ear].visibility >= n_lm[o_ear].visibility else pt2d(o_ear)
         eye_idx = 2 if n_lm[2].visibility >= n_lm[5].visibility else 5
         visible_eye = pt2d(eye_idx)
@@ -826,7 +913,7 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         # ==================== 【RULA 獨立關節角度解算】 ====================
         ang_lower_arm = abs(180.0 - calculate_2d_angle(sh, el, wr))
         
-        trunk_vec = hp - sh
+        trunk_vec = hp_center - sh_center
         ref_sh_down = sh + trunk_vec
         ang_upper_arm = calculate_2d_angle(ref_sh_down, sh, el)
         
@@ -848,7 +935,8 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         # Hand world 只做手掌局部幾何品質資訊，不拿它與 Pose world 相減。
         hand_ms = float("nan")
         hand_comp = {"matched": False, "reason": "Hand 模式未啟用或模型不可用", "angle_2d": float("nan"),
-                     "distance_ratio": float("nan"), "hand_world_palm_length": float("nan"),
+                     "distance_ratio": float("nan"), "other_hand_margin_ratio": float("nan"),
+                     "palm_forearm_ratio": float("nan"), "hand_world_palm_length": float("nan"),
                      "hand_world_palm_spread_deg": float("nan"), "handedness": "", "hand_points": None}
         if hand_task is not None:
             start_hand = time.perf_counter()
@@ -868,10 +956,11 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         pose_wrist_angle = wrist_raw_angle
         hand_angle = float(hand_comp["angle_2d"])
         hand_diff = abs(hand_angle - pose_wrist_angle) if np.isfinite(hand_angle) else float("nan")
-        hand_quality_ok = bool(
-            hand_comp["matched"] and np.isfinite(hand_diff)
-            and hand_comp["distance_ratio"] <= 0.32 and hand_diff <= 35.0
+        pose_2d_hand_diff = abs(hand_angle - raw_wrist_2d) if np.isfinite(hand_angle) and np.isfinite(raw_wrist_2d) else float("nan")
+        hand_quality_ok, hand_quality_problems = evaluate_hand_geometry(
+            hand_comp, raw_wrist_2d, float(n_lm[t_wr].visibility), float(n_lm[t_el].visibility)
         )
+        hand_comp["quality_notes"] = "；".join(hand_quality_problems) if hand_quality_problems else "幾何一致性通過（非準確率認證）"
         hand_used_for_score = bool(hand_scoring_policy == "gated" and hand_quality_ok)
         if hand_used_for_score:
             # 僅在使用者主動切換實驗模式、且兩個模型大致一致時才以 Hand 角度計分。
@@ -881,11 +970,11 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         wt_score = int(manual_mods.get("wrist_twist_score", 1))
         is_wrist_deviated = bool(manual_mods.get("wrist_deviated", False))
 
-        vertical_up = np.array([hp[0], hp[1] - 100.0])
-        ang_trunk = calculate_2d_angle(vertical_up, hp, sh)
+        vertical_up = np.array([hp_center[0], hp_center[1] - 100.0])
+        ang_trunk = calculate_2d_angle(vertical_up, hp_center, sh_center)
 
         head_center = ear * 0.6 + visible_eye * 0.4
-        ang_neck = abs(180.0 - calculate_2d_angle(hp, sh, head_center))
+        ang_neck = abs(180.0 - calculate_2d_angle(hp_center, sh_center, head_center))
 
         # RULA 腿足支撐與平衡需依實際作業情境確認，不再用兩腳高度差猜測。
         lg_score = int(manual_mods.get("leg_score", 2))
@@ -940,6 +1029,16 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         sc_a, sc_b, sc_c, sc_d, grand, al = compute_rula_full(
             s_ua, s_la, s_wr, wt_score, s_nk, s_tk, lg_score, m_val, f_val
         )
+        # 同一影格相同的其他關節分數，只替換手腕「屈曲/伸展」部位分數做情境對照。
+        # 即使選擇安全比較模式，兩種情境仍可報表比較，原本 RULA 分數不被覆蓋。
+        score_pose_ref = compute_rula_full(
+            s_ua, s_la, get_wrist_score(pose_wrist_angle, is_deviated=is_wrist_deviated),
+            wt_score, s_nk, s_tk, lg_score, m_val, f_val
+        )
+        score_hand_ref = (compute_rula_full(
+            s_ua, s_la, get_wrist_score(hand_angle, is_deviated=is_wrist_deviated),
+            wt_score, s_nk, s_tk, lg_score, m_val, f_val
+        ) if np.isfinite(hand_angle) else None)
         
         # 打包全部 33 點座標供繪圖器渲染
         pts_dict = {
@@ -967,7 +1066,15 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
             f"{side_prefix}Pose舊版手腕角度": round(pose_wrist_angle, 1),
             f"{side_prefix}PoseHand實驗手腕角度": round(hand_angle, 1) if np.isfinite(hand_angle) else np.nan,
             f"{side_prefix}新舊手腕差異": round(hand_diff, 1) if np.isfinite(hand_diff) else np.nan,
+            f"{side_prefix}Pose2D與Hand2D差異": round(pose_2d_hand_diff, 1) if np.isfinite(pose_2d_hand_diff) else np.nan,
+            f"{side_prefix}Hand品質原因": hand_comp["quality_notes"],
+            f"{side_prefix}Hand掌長前臂比": hand_comp["palm_forearm_ratio"],
+            f"{side_prefix}Hand對側手匹配差距比": hand_comp["other_hand_margin_ratio"],
             f"{side_prefix}Hand匹配成功": bool(hand_comp["matched"]),
+            f"{side_prefix}Pose基準GrandScore": score_pose_ref[4],
+            f"{side_prefix}Hand情境GrandScore": score_hand_ref[4] if score_hand_ref else np.nan,
+            f"{side_prefix}Hand情境與Pose總分差": score_hand_ref[4] - score_pose_ref[4] if score_hand_ref else np.nan,
+            f"{side_prefix}Hand情境說明": "僅替換手腕屈伸代理值，其他部位與加分固定；不是新的標準評分方法",
             f"{side_prefix}Hand品質通過": hand_quality_ok,
             f"{side_prefix}Hand用於計分": hand_used_for_score,
             f"{side_prefix}Hand警示原因": hand_comp["reason"],
@@ -976,6 +1083,9 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
             f"{side_prefix}HandWorld掌心長度(模型單位)": round(hand_comp["hand_world_palm_length"], 4) if np.isfinite(hand_comp["hand_world_palm_length"]) else np.nan,
             f"{side_prefix}HandWorld掌指張角(度)": round(hand_comp["hand_world_palm_spread_deg"], 1) if np.isfinite(hand_comp["hand_world_palm_spread_deg"]) else np.nan,
             f"{side_prefix}側面Pose偵測耗時(ms)": side_pose_ms,
+            f"{side_prefix}Pose腕點可見度": round(float(n_lm[t_wr].visibility), 3),
+            f"{side_prefix}Pose肘點可見度": round(float(n_lm[t_el].visibility), 3),
+            "角度定義註記": "肩肘腕／軀幹為單一鏡頭 2D 投影代理值，非經校準人體解剖角度",
             f"{side_prefix}Hand偵測耗時(ms)": hand_ms,
             f"{side_prefix}手腕計分演算法": "Hand實驗" if hand_used_for_score else "Pose v5",
             f"{side_prefix}手腕角度_2D": round(raw_wrist_2d, 1) if np.isfinite(raw_wrist_2d) else np.nan,
@@ -1024,6 +1134,17 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         # 暫存於回傳 dict，呼叫端在建立 CSV 前 pop，避免大量照片或座標混入 CSV。
         data["_v6_hand_points"] = hand_comp["hand_points"]
         data["_v6_hand_angle"] = hand_angle
+        data["_v7_keypoints"] = {
+            "評估側": target_side, "影像寬": work_w, "影像高": work_h,
+            "Pose影像像素座標": make_pose_keypoint_snapshot(
+                n_lm, work_w, work_h, [0,2,5,7,8,11,12,13,14,15,16,17,18,19,20,23,24,25,26,27,28]),
+            "Hand影像像素座標": hand_comp["hand_points"],
+            "Hand模型標籤": hand_comp["handedness"],
+            "角度原始估計": {"pose2d": raw_wrist_2d, "pose3d": raw_wrist_3d,
+                         "pose混合": pose_wrist_angle, "hand2d": hand_angle,
+                         "上臂": ang_upper_arm, "前臂屈曲": ang_lower_arm,
+                         "軀幹2d投影": ang_trunk, "頸部2d代理": ang_neck},
+        }
         return True, data, frame_annotated, conf_side
     except Exception:
         logging.exception("analyze_side_camera failed for %s", target_side)
@@ -1056,93 +1177,101 @@ if "analysis_done" not in st.session_state:
     st.session_state.hand_review_images = {}
     st.session_state.hand_model_status = "未執行"
 
-# 讓使用者選擇單側評估，或三鏡頭左右同步分開計算
-eval_mode = st.radio(
-    "請選擇本次作業分析之【評估模式】:",
-    options=[
-        "右手側",
-        "左手側",
-        "左右側同步計算 (需上傳正面、右手側、左手側三個視角影片)"
-    ],
-    index=0,
-    horizontal=True,
-    help="選取單側時需上傳「正面 + 該側鏡頭」；選取「左右側同步計算」時，三個鏡頭影片皆須上傳，系統將針對左右手分開計算、分析與擷取。"
+# 分頁只整理介面，所有欄位與後續計分變數仍使用原有流程。
+st.caption("操作方式：先設定影片與基本參數；其餘辨識、人工條件及 Hand 實驗可按需要切換分頁設定。")
+setup_basic, setup_auto, setup_manual, setup_hand = st.tabs(
+    ["🎬 影片與基本設定", "🤖 自動辨識條件", "🧍 人工確認（必要）", "🖐️ Hand 實驗"]
 )
+with setup_basic:
+    # 讓使用者選擇單側評估，或三鏡頭左右同步分開計算
+    eval_mode = st.radio(
+        "請選擇本次作業分析之【評估模式】:",
+        options=[
+            "右手側",
+            "左手側",
+            "左右側同步計算 (需上傳正面、右手側、左手側三個視角影片)"
+        ],
+        index=0,
+        horizontal=True,
+        help="選取單側時需上傳「正面 + 該側鏡頭」；選取「左右側同步計算」時，三個鏡頭影片皆須上傳，系統將針對左右手分開計算、分析與擷取。"
+    )
 
-st.header("第一步：上傳視角影片")
-col_front, col_right, col_left = st.columns(3)
+    st.subheader("上傳視角影片")
+    col_front, col_right, col_left = st.columns(3)
 
-with col_front:
-    vid_front_file = st.file_uploader("1. 正面鏡頭 (必填: 判定外展/交叉/側傾)", type=['mp4', 'mov', 'avi'])
-with col_right:
-    vid_right_file = st.file_uploader("2. 右手側鏡頭 (量測並擷取右手側動作)", type=['mp4', 'mov', 'avi'])
-with col_left:
-    vid_left_file = st.file_uploader("3. 左手側鏡頭 (量測並擷取左手側動作)", type=['mp4', 'mov', 'avi'])
+    with col_front:
+        vid_front_file = st.file_uploader("1. 正面鏡頭 (必填: 判定外展/交叉/側傾)", type=['mp4', 'mov', 'avi'])
+    with col_right:
+        vid_right_file = st.file_uploader("2. 右手側鏡頭 (量測並擷取右手側動作)", type=['mp4', 'mov', 'avi'])
+    with col_left:
+        vid_left_file = st.file_uploader("3. 左手側鏡頭 (量測並擷取左手側動作)", type=['mp4', 'mov', 'avi'])
 
-st.header("第二步：等距抽樣與負載參數設定")
-col_p1, col_p2, col_p3 = st.columns(3)
-with col_p1:
-    num_samples = st.slider("等距抽樣張數", min_value=5, max_value=100, value=25)
-with col_p2:
-    combo_muscle = st.selectbox("肌肉使用分數 (Muscle Score):", ["0: 非靜態且動作少於每分鐘 4 次", "1: 姿勢維持超過 1 分鐘或動作每分鐘至少 4 次"])
-with col_p3:
-    combo_force = st.selectbox("負載與施力 (Force/Load):", ["0: < 2kg (間歇施力)", "1: 2-10kg (間歇施力)", "2: 2-10kg 靜態／重複施力", "3: >10kg 負載、重複施力或衝擊力"])
+    st.subheader("抽樣與負重設定")
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        num_samples = st.slider("等距抽樣張數", min_value=5, max_value=100, value=25)
+    with col_p2:
+        combo_muscle = st.selectbox("肌肉使用分數 (Muscle Score):", ["0: 非靜態且動作少於每分鐘 4 次", "1: 姿勢維持超過 1 分鐘或動作每分鐘至少 4 次"])
+    with col_p3:
+        combo_force = st.selectbox("負載與施力 (Force/Load):", ["0: < 2kg (間歇施力)", "1: 2-10kg (間歇施力)", "2: 2-10kg 靜態／重複施力", "3: >10kg 負載、重複施力或衝擊力"])
 
 
-st.header("第三步：自動辨識設定")
-st.caption("逐項選擇是否使用影像向量自動判斷；未勾選者由使用者手動設定。影像判斷為代理演算法，遮擋、轉身或不同步可能影響結果。")
-AUTO_FLAGS = {
-    "is_abducted": "上臂外展（正面肩肘相對位置）",
-    "is_across_midline": "前臂跨越身體中線（正面向量投影）",
-    "is_out_to_side": "前臂向外側工作（正面位置）",
-    "is_side_bending": "軀幹側彎（肩髖中心線）",
-    "is_neck_side_bending": "頸部側彎（頭頸相對軀幹）",
-    "upper_arm_extended": "上臂向後伸展（側面朝向判斷；實驗性）",
-}
-auto_selection = {}
-manual_front = {}
-front_labels = {
-    "is_abducted": "上臂外展（+1）",
-    "is_across_midline": "前臂跨中線（+1）",
-    "is_out_to_side": "前臂向外側工作（+1）",
-    "is_side_bending": "軀幹側彎（+1）",
-    "is_neck_side_bending": "頸部側彎（+1）",
-}
-with st.container():
-    auto_cols = st.columns(2)
-    for pos, (flag, caption) in enumerate(AUTO_FLAGS.items()):
-        with auto_cols[pos % 2]:
-            auto_selection[flag] = st.checkbox("自動辨識｜" + caption, value=(flag != "upper_arm_extended"), key="v5_auto_"+flag)
-    with st.expander("手動判斷：僅顯示未啟用自動辨識的條件", expanded=True):
-        for flag, caption in front_labels.items():
-            if not auto_selection[flag]:
-                mc1, mc2 = st.columns(2)
-                with mc1:
-                    manual_front[("右手側", flag)] = st.checkbox("右側｜" + caption, value=False, key="v5_manual_right_"+flag)
-                with mc2:
-                    manual_front[("左手側", flag)] = st.checkbox("左側｜" + caption, value=False, key="v5_manual_left_"+flag)
+with setup_auto:
+    st.subheader("自動辨識設定")
+    st.caption("逐項選擇是否使用影像向量自動判斷；未勾選者由使用者手動設定。影像判斷為代理演算法，遮擋、轉身或不同步可能影響結果。")
+    AUTO_FLAGS = {
+        "is_abducted": "上臂外展（正面肩肘相對位置）",
+        "is_across_midline": "前臂跨越身體中線（正面向量投影）",
+        "is_out_to_side": "前臂向外側工作（正面位置）",
+        "is_side_bending": "軀幹側彎（肩髖中心線）",
+        "is_neck_side_bending": "頸部側彎（頭頸相對軀幹）",
+        "upper_arm_extended": "上臂向後伸展（側面朝向判斷；實驗性）",
+    }
+    auto_selection = {}
+    manual_front = {}
+    front_labels = {
+        "is_abducted": "上臂外展（+1）",
+        "is_across_midline": "前臂跨中線（+1）",
+        "is_out_to_side": "前臂向外側工作（+1）",
+        "is_side_bending": "軀幹側彎（+1）",
+        "is_neck_side_bending": "頸部側彎（+1）",
+    }
+    with st.container():
+        auto_cols = st.columns(2)
+        for pos, (flag, caption) in enumerate(AUTO_FLAGS.items()):
+            with auto_cols[pos % 2]:
+                auto_selection[flag] = st.checkbox("自動辨識｜" + caption, value=(flag != "upper_arm_extended"), key="v5_auto_"+flag)
+        with st.expander("手動判斷：僅顯示未啟用自動辨識的條件", expanded=True):
+            for flag, caption in front_labels.items():
+                if not auto_selection[flag]:
+                    mc1, mc2 = st.columns(2)
+                    with mc1:
+                        manual_front[("右手側", flag)] = st.checkbox("右側｜" + caption, value=False, key="v5_manual_right_"+flag)
+                    with mc2:
+                        manual_front[("左手側", flag)] = st.checkbox("左側｜" + caption, value=False, key="v5_manual_left_"+flag)
 
-st.subheader("仍需人工輸入的項目")
-st.caption("以下項目不能單靠 33 點 Pose 可靠判定，包括實際受力、支撐及前臂旋轉；本版保留人工選項。未啟用上臂後伸自動判斷時，亦由使用者自行勾選。")
-mod_col_a, mod_col_b, mod_col_c = st.columns(3)
-with mod_col_a:
-    leg_support_choice = st.selectbox("腿與足部支撐／平衡（必選）", ["請先目視確認…", "腿足受支撐且平衡（1分）", "腿足未受支撐或不平衡（2分）"], index=0)
-    neck_twisted_manual = st.checkbox("頸部有扭轉（+1）", value=False)
-    neck_extended_manual = st.checkbox("頸部後仰／伸展", value=False)
-    trunk_twisted_manual = st.checkbox("軀幹有扭轉（+1）", value=False)
-    trunk_extended_manual = st.checkbox("軀幹向後伸展", value=False)
-with mod_col_b:
-    right_wrist_twist_choice = st.selectbox("右手腕扭轉（必選）", ["請先目視確認…", "中間範圍（1分）", "接近旋轉極限（2分）"], index=0)
-    right_wrist_deviated = st.checkbox("右手腕尺偏／橈偏（+1）", value=False)
-    right_shoulder_raised = st.checkbox("右肩抬高／聳肩（+1）", value=False)
-    right_arm_supported = st.checkbox("右上臂有支撐（-1）", value=False)
-    right_arm_extended = st.checkbox("右上臂後伸超過 20°（人工輸入／辨識不明時備用）", value=False)
-with mod_col_c:
-    left_wrist_twist_choice = st.selectbox("左手腕扭轉（必選）", ["請先目視確認…", "中間範圍（1分）", "接近旋轉極限（2分）"], index=0)
-    left_wrist_deviated = st.checkbox("左手腕尺偏／橈偏（+1）", value=False)
-    left_shoulder_raised = st.checkbox("左肩抬高／聳肩（+1）", value=False)
-    left_arm_supported = st.checkbox("左上臂有支撐（-1）", value=False)
-    left_arm_extended = st.checkbox("左上臂後伸超過 20°（人工輸入／辨識不明時備用）", value=False)
+with setup_manual:
+    st.subheader("仍需人工輸入的項目")
+    st.caption("以下項目不能單靠 33 點 Pose 可靠判定，包括實際受力、支撐及前臂旋轉；本版保留人工選項。未啟用上臂後伸自動判斷時，亦由使用者自行勾選。")
+    mod_col_a, mod_col_b, mod_col_c = st.columns(3)
+    with mod_col_a:
+        leg_support_choice = st.selectbox("腿與足部支撐／平衡（必選）", ["請先目視確認…", "腿足受支撐且平衡（1分）", "腿足未受支撐或不平衡（2分）"], index=0)
+        neck_twisted_manual = st.checkbox("頸部有扭轉（+1）", value=False)
+        neck_extended_manual = st.checkbox("頸部後仰／伸展", value=False)
+        trunk_twisted_manual = st.checkbox("軀幹有扭轉（+1）", value=False)
+        trunk_extended_manual = st.checkbox("軀幹向後伸展", value=False)
+    with mod_col_b:
+        right_wrist_twist_choice = st.selectbox("右手腕扭轉（必選）", ["請先目視確認…", "中間範圍（1分）", "接近旋轉極限（2分）"], index=0)
+        right_wrist_deviated = st.checkbox("右手腕尺偏／橈偏（+1）", value=False)
+        right_shoulder_raised = st.checkbox("右肩抬高／聳肩（+1）", value=False)
+        right_arm_supported = st.checkbox("右上臂有支撐（-1）", value=False)
+        right_arm_extended = st.checkbox("右上臂後伸超過 20°（人工輸入／辨識不明時備用）", value=False)
+    with mod_col_c:
+        left_wrist_twist_choice = st.selectbox("左手腕扭轉（必選）", ["請先目視確認…", "中間範圍（1分）", "接近旋轉極限（2分）"], index=0)
+        left_wrist_deviated = st.checkbox("左手腕尺偏／橈偏（+1）", value=False)
+        left_shoulder_raised = st.checkbox("左肩抬高／聳肩（+1）", value=False)
+        left_arm_supported = st.checkbox("左上臂有支撐（-1）", value=False)
+        left_arm_extended = st.checkbox("左上臂後伸超過 20°（人工輸入／辨識不明時備用）", value=False)
 
 
 def build_manual_mods(side_name):
@@ -1171,16 +1300,18 @@ def manual_front_fallback():
     return {key: False for key in front_keys}
 
 # ==================== 【V6：Pose + Hand 實驗設定】 ====================
-st.header("第四步：Pose + Hand 手腕實驗設定")
-st.caption("預設只比較、不改變 v5 RULA 分數。Hand Landmarker 的 21 個關鍵點提供額外手掌資訊；Hand World 不是 Pose World 的共同座標系。")
-v6_enable_hand = st.checkbox("啟用 Hand Landmarker 手腕實驗", value=True, key="v6_enable_hand")
-v6_policy_label = st.radio(
-    "手腕 RULA 計分來源",
-    ["安全比較模式：RULA 維持 Pose v5 計分", "實驗計分模式：匹配品質達標且與 Pose 接近時採 Hand 角度"],
-    index=0, horizontal=False, disabled=not v6_enable_hand, key="v6_scoring_policy",
-)
-v6_hand_policy = "gated" if v6_enable_hand and v6_policy_label.startswith("實驗") else "compare"
-st.caption("實驗模式也不會自動評定前臂旋前／旋後、負重或真實受力。未辨識到手、手腕點不匹配或兩演算法差異太大時，會自動退回 Pose。")
+with setup_hand:
+    st.subheader("Pose + Hand 手腕實驗")
+    st.caption("預設只比較、不改變 v5 RULA 分數。Hand Landmarker 的 21 個關鍵點提供額外手掌資訊；Hand World 不是 Pose World 的共同座標系。")
+    v6_enable_hand = st.checkbox("啟用 Hand Landmarker 手腕實驗", value=True, key="v6_enable_hand")
+    v6_policy_label = st.radio(
+        "手腕 RULA 計分來源",
+        ["安全比較模式：RULA 維持 Pose v5 計分", "實驗計分模式：幾何品質達標才採 Hand 角度（研究用途）"],
+        index=0, horizontal=False, disabled=not v6_enable_hand, key="v6_scoring_policy",
+    )
+    v6_hand_policy = "gated" if v6_enable_hand and v6_policy_label.startswith("實驗") else "compare"
+    st.caption("實驗模式也不會自動評定前臂旋前／旋後、負重或真實受力。未辨識到手、手腕點不匹配或兩演算法差異太大時，會自動退回 Pose。")
+    raw_image_export = st.checkbox("ZIP 一起保存未繪圖原始影格（便於角度核對）", value=True, key="v7_raw_frames")
 
 # 執行分析按鈕
 if st.button("🚀 啟動全關節生物力學分析", type="primary", use_container_width=True):
@@ -1210,7 +1341,7 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             st.error(f"請先人工確認{required_side}手腕扭轉狀態，再啟動分析。")
             st.stop()
 
-    with st.spinner(f"系統正在進行 33 點全解剖特徵擷取與 RULA 解算（模式：{eval_mode}）..."):
+    with st.spinner(f"系統正在進行 33 點姿態特徵擷取與 RULA 解算（模式：{eval_mode}）..."):
         st.session_state.v4_overrides = {}
         st.session_state.display_images_b64 = []
         st.session_state.display_right_b64 = []
@@ -1279,6 +1410,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             zip_right_imgs = []
             zip_left_imgs = []
             zip_hand_imgs = []
+            zip_raw_imgs = []
+            keypoint_records = []
             display_right_b64 = []
             display_left_b64 = []
             skipped_right = 0
@@ -1308,6 +1441,11 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                     s_l, l_frame = cap_left.read()
 
                     if s_f and s_r and s_l:
+                        if raw_image_export:
+                            for label, raw in (("Front", f_frame), ("Right", r_frame), ("Left", l_frame)):
+                                payload = _encode_preview(raw)
+                                if payload:
+                                    zip_raw_imgs.append((f"Raw_Frames/{label}/Sample_{i+1:03d}_{sec}s.jpg", payload))
                         # 1. 正面鏡頭分別提取右手與左手的冠狀面外展/交叉補正
                         front_ok_r, front_mods_r = analyze_front_camera(f_frame, pose, "右手側")
                         front_ok_l, front_mods_l = analyze_front_camera(f_frame, pose, "左手側")
@@ -1339,6 +1477,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         if succ_r and data_r is not None:
                             hand_points_r = data_r.pop("_v6_hand_points", None)
                             hand_angle_r = data_r.pop("_v6_hand_angle", float("nan"))
+                            snap_r = data_r.pop("_v7_keypoints", None)
+                            if snap_r is not None:
+                                keypoint_records.append({"樣本編號": i+1, "時間(秒)": sec, **snap_r})
                             rec_r = {"樣本編號": i + 1, "時間(秒)": sec, "評估側": "右手側", "右側信賴度(%)": round(conf_r, 1)}
                             rec_r.update(data_r)
                             right_only_records.append(rec_r)
@@ -1363,6 +1504,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         if succ_l and data_l is not None:
                             hand_points_l = data_l.pop("_v6_hand_points", None)
                             hand_angle_l = data_l.pop("_v6_hand_angle", float("nan"))
+                            snap_l = data_l.pop("_v7_keypoints", None)
+                            if snap_l is not None:
+                                keypoint_records.append({"樣本編號": i+1, "時間(秒)": sec, **snap_l})
                             rec_l = {"樣本編號": i + 1, "時間(秒)": sec, "評估側": "左手側", "左側信賴度(%)": round(conf_l, 1)}
                             rec_l.update(data_l)
                             left_only_records.append(rec_l)
@@ -1442,8 +1586,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                 except Exception: pass
 
             df_comb = pd.DataFrame(combined_records) if combined_records else pd.DataFrame()
-            df_r = pd.DataFrame(right_only_records) if right_only_records else pd.DataFrame()
-            df_l = pd.DataFrame(left_only_records) if left_only_records else pd.DataFrame()
+            df_r = add_hand_temporal_notes(pd.DataFrame(right_only_records), "右手側") if right_only_records else pd.DataFrame()
+            df_l = add_hand_temporal_notes(pd.DataFrame(left_only_records), "左手側") if left_only_records else pd.DataFrame()
 
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1460,6 +1604,13 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                     zf.writestr(f"左側鏡頭擷取照片/{fname}", fbytes)
                 for fname, fbytes in zip_hand_imgs:
                     zf.writestr(fname, fbytes)
+                for fname, fbytes in zip_raw_imgs:
+                    zf.writestr(fname, fbytes)
+                if keypoint_records:
+                    zf.writestr("Diagnostics/Keypoint_Coordinates.jsonl",
+                        "\n".join(json.dumps(clean_json(v), ensure_ascii=False, allow_nan=False)
+                                  for v in keypoint_records).encode("utf-8"))
+                zf.writestr("Diagnostics/V7_Angle_Definitions.txt", ANGLE_DEFINITIONS.encode("utf-8"))
                 if not df_r.empty or not df_l.empty:
                     comparison = pd.concat([df.assign(評估側=label) for label, df in (("右手側", df_r), ("左手側", df_l)) if not df.empty], ignore_index=True)
                     zf.writestr("Hand_Comparison/Comparison_Data.csv", comparison.to_csv(index=False).encode("utf-8-sig"))
@@ -1514,6 +1665,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             records = []
             zip_images = []
             zip_hand_imgs = []
+            zip_raw_imgs = []
+            keypoint_records = []
             display_images_b64 = []
             skipped_count = 0
             skip_diagnostics = []
@@ -1537,6 +1690,11 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                     s_s, s_frame = cap_side.read()
 
                     if s_f and s_s:
+                        if raw_image_export:
+                            for label, raw in (("Front", f_frame), ("Right" if target_side == "右手側" else "Left", s_frame)):
+                                payload = _encode_preview(raw)
+                                if payload:
+                                    zip_raw_imgs.append((f"Raw_Frames/{label}/Sample_{i+1:03d}_{sec}s.jpg", payload))
                         front_ok, front_mods = analyze_front_camera(f_frame, pose, target_side)
                         if not front_ok:
                             front_mods = manual_front_fallback()
@@ -1552,6 +1710,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         if succ_s and data is not None:
                             hand_points_s = data.pop("_v6_hand_points", None)
                             hand_angle_s = data.pop("_v6_hand_angle", float("nan"))
+                            snap_s = data.pop("_v7_keypoints", None)
+                            if snap_s is not None:
+                                keypoint_records.append({"樣本編號": i+1, "時間(秒)": sec, **snap_s})
                             record = {
                                 "樣本編號": i + 1,
                                 "時間(秒)": sec,
@@ -1594,7 +1755,7 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             except Exception:
                 pass
 
-            df_result = pd.DataFrame(records) if records else pd.DataFrame()
+            df_result = add_hand_temporal_notes(pd.DataFrame(records), target_side) if records else pd.DataFrame()
             
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1605,6 +1766,13 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                     zf.writestr(f"Photos/{fname}", fbytes)
                 for fname, fbytes in zip_hand_imgs:
                     zf.writestr(fname, fbytes)
+                for fname, fbytes in zip_raw_imgs:
+                    zf.writestr(fname, fbytes)
+                if keypoint_records:
+                    zf.writestr("Diagnostics/Keypoint_Coordinates.jsonl",
+                        "\n".join(json.dumps(clean_json(v), ensure_ascii=False, allow_nan=False)
+                                  for v in keypoint_records).encode("utf-8"))
+                zf.writestr("Diagnostics/V7_Angle_Definitions.txt", ANGLE_DEFINITIONS.encode("utf-8"))
                 if not df_result.empty:
                     zf.writestr("Hand_Comparison/Comparison_Data.csv", df_result.to_csv(index=False).encode("utf-8-sig"))
 
@@ -1625,6 +1793,35 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             hand_task.close()
         except Exception:
             logging.exception("Hand model close failed")
+
+def add_hand_temporal_notes(df, side):
+    """Post-hoc diagnostic only. Real fast movements are NOT automatically incorrect.
+
+    Only mark a central sample when its two sampled neighbors agree closely, while
+    the central Hand2D reading is distant from both. Does not alter RULA scoring.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy().sort_values("時間(秒)")
+    prefix = "右手" if side == "右手側" else "左手"
+    column = f"{prefix}PoseHand實驗手腕角度"
+    if column not in out:
+        return out
+    values = pd.to_numeric(out[column], errors="coerce").to_numpy(dtype=float)
+    sample_ids = pd.to_numeric(out["樣本編號"], errors="coerce").to_numpy(dtype=float)
+    flags = np.zeros(len(out), dtype=bool)
+    for i in range(1,len(out)-1):
+        if not (np.all(np.isfinite(values[i-1:i+2])) and
+                sample_ids[i]-sample_ids[i-1] == 1 and
+                sample_ids[i+1]-sample_ids[i] == 1):
+            continue
+        if (abs(values[i-1]-values[i+1]) <= 15 and
+            abs(values[i]-values[i-1]) >= 35 and
+            abs(values[i]-values[i+1]) >= 35):
+            flags[i] = True
+    out["Hand時序孤立尖峰（僅供研究）"] = flags
+    return out.sort_index()
+
 
 # ==================== 【V4：時間異常檢測／逐影格人工複核】 ====================
 # 警示閾值是工程篩檢參數，不是已驗證的人體角度準確性標準。
@@ -1712,7 +1909,7 @@ def v4_make_zip(original_zip, reviews, anomaly_frames):
 
 
 def v4_show_review_center():
-    st.header("🧪 V4：異常影格審核中心／人工修正／風險時間軸")
+    st.subheader("異常影格審核／逐張人工修正／風險時間軸")
     mode = st.session_state.analyzed_mode
     both = mode == "左右側同步計算"
     available = {}
@@ -1826,13 +2023,13 @@ def v4_show_review_center():
     st.subheader("📦 下載含異常清單與人工覆核紀錄的完整 ZIP")
     enhanced = v4_make_zip(st.session_state.zip_bytes, st.session_state.v4_overrides, all_checked)
     st.caption("使用瀏覽器本地 Blob 下載，避開部分 Streamlit Cloud /media 下載路徑失效的問題。")
-    render_blob_download_button(enhanced, "RULA_V4_Review_Report.zip", "📥 下載 V4 完整 ZIP（原始資料＋審核結果）")
+    render_blob_download_button(enhanced, "RULA_V7_Review_Report.zip", "📥 下載審核 ZIP（原始資料＋人工修正紀錄）")
 
 
 # ==================== 【V6：Pose / Pose+Hand 手腕演算法比較中心】 ====================
 def v6_show_hand_comparison():
-    st.subheader("🖐️ 手腕演算法比較實驗中心（Pose v5 vs Pose + Hand v6）")
-    st.caption("Hand 新角度為同一張影像的 2D 前臂與手掌方向代理角度；Hand World 是模型估計的手掌局部座標，沒有與 Pose World 混算。")
+    st.subheader("手腕演算法比較：Pose 2D／3D／混合 vs Hand 2D")
+    st.caption("公平對照：Pose 2D vs Hand 2D。原版 Pose 混合角度與 Pose 3D 額外保留；Hand World 為手掌局部資訊，不與 Pose World 混用。時序尖峰僅作診斷，不會自動判錯或改分。")
     st.info("模型狀態：" + str(st.session_state.get("hand_model_status", "未知")))
     both = st.session_state.analyzed_mode == "左右側同步計算"
     available = ({"右手側": st.session_state.df_right_only, "左手側": st.session_state.df_left_only}
@@ -1845,7 +2042,11 @@ def v6_show_hand_comparison():
     prefix = "右手" if side == "右手側" else "左手"
     old_col = f"{prefix}Pose舊版手腕角度"
     new_col = f"{prefix}PoseHand實驗手腕角度"
-    diff_col = f"{prefix}新舊手腕差異"
+    diff_col = f"{prefix}Pose2D與Hand2D差異"
+    legacy_diff_col = f"{prefix}新舊手腕差異"
+    pose2d_col = f"{prefix}手腕角度_2D"
+    pose3d_col = f"{prefix}手腕角度_3D"
+    quality_col = f"{prefix}Hand品質原因"
     time_col = f"{prefix}Hand偵測耗時(ms)"
     pose_ms_col = f"{prefix}側面Pose偵測耗時(ms)"
     if old_col not in df.columns:
@@ -1861,14 +2062,18 @@ def v6_show_hand_comparison():
     c5.metric("Hand 中位耗時", f"{df[time_col].median():.0f} ms" if df[time_col].notna().any() else "未執行")
     st.caption("耗時數值是在本次 Streamlit 執行環境實測，並非模型官方效能；Pose 欄只計側面 Pose 偵測（含重試），不包含前鏡頭偵測／骨架繪圖。")
     ids = df["樣本編號"].astype(int).tolist()
-    chosen = st.selectbox("選取影格查看兩版結果（可選 9、25、42 等）", ids, key="v6_hand_sample")
+    chosen = st.selectbox("選取影格查看兩版結果（可選 9、25、42 等）", ids,
+                          index=ids.index(9) if 9 in ids else 0, key="v6_hand_sample")
     row = df[df["樣本編號"].astype(int) == int(chosen)].iloc[0]
-    a, b, c = st.columns(3)
-    a.metric("Pose v5", f"{row[old_col]:.1f}°")
-    b.metric("Pose + Hand v6", f"{row[new_col]:.1f}°" if pd.notna(row[new_col]) else "未辨識")
-    c.metric("角度差", f"{row[diff_col]:.1f}°" if pd.notna(row[diff_col]) else "—")
+    a, b, c, d = st.columns(4)
+    a.metric("Pose 2D", f"{row[pose2d_col]:.1f}°" if pd.notna(row[pose2d_col]) else "—")
+    b.metric("Pose 3D", f"{row[pose3d_col]:.1f}°" if pd.notna(row[pose3d_col]) else "—")
+    c.metric("Pose 混合 v5", f"{row[old_col]:.1f}°" if pd.notna(row[old_col]) else "—")
+    d.metric("Hand 2D", f"{row[new_col]:.1f}°" if pd.notna(row[new_col]) else "未辨識")
+    st.write(f"**Pose2D／Hand2D 比較差：** {row[diff_col]:.1f}°" if pd.notna(row[diff_col]) else "Hand 無有效 2D 對照")
     st.write(f"樣本 #{int(chosen)}｜{row['時間(秒)']} 秒｜實際計分演算法：{row[f'{prefix}手腕計分演算法']}")
-    st.caption(f"匹配狀態：{row[f'{prefix}Hand匹配成功']}；品質門檻：{row[f'{prefix}Hand品質通過']}；原因：{row[f'{prefix}Hand警示原因'] or '無'}")
+    st.caption(f"同條件情境比較：Pose 基準 RULA {row[f'{prefix}Pose基準GrandScore']}；若只將手腕屈伸改用 Hand，RULA {row[f'{prefix}Hand情境GrandScore']}（無 Hand 時為空值）。此為敏感度對照，不代表 Hand 方案更準確。")
+    st.caption(f"匹配：{row[f'{prefix}Hand匹配成功']}；幾何品質篩檢：{row[f'{prefix}Hand品質通過']}；原因：{row[quality_col]}")
     st.caption(f"Hand World 手掌局部長度（模型單位）：{row[f'{prefix}HandWorld掌心長度(模型單位)']}；掌指張角：{row[f'{prefix}HandWorld掌指張角(度)']}°（僅供比較，不是手腕屈曲角度）")
     pair = st.session_state.get("hand_review_images", {}).get((side, int(chosen)))
     if pair:
@@ -1882,13 +2087,14 @@ def v6_show_hand_comparison():
         )
     else:
         st.warning("找不到這個樣本的比較照片；請檢查 ZIP 的 Hand_Comparison 資料夾。")
-    table_cols = ["樣本編號", "時間(秒)", old_col, new_col, diff_col,
+    table_cols = ["樣本編號", "時間(秒)", pose2d_col, pose3d_col, old_col, new_col, diff_col, quality_col,
+                  f"{prefix}Pose基準GrandScore", f"{prefix}Hand情境GrandScore",
                   f"{prefix}Hand匹配成功", f"{prefix}Hand品質通過", f"{prefix}Hand用於計分",
                   pose_ms_col, time_col]
     st.dataframe(df[table_cols], use_container_width=True, hide_index=True)
-    graph = df[["時間(秒)", old_col, new_col]].set_index("時間(秒)")
+    graph = df[["時間(秒)", pose2d_col, old_col, new_col]].set_index("時間(秒)")
     st.line_chart(graph, x_label="影片時間（秒）", y_label="手腕角度代理值（度）")
-    st.caption("兩條曲線差距變小，不等於測量真值更準；建議後續以少量人工標記或量角器參考值驗證。")
+    st.caption("公平比較以 Pose 2D 與 Hand 2D 為主；Pose 混合保留供回歸測試。角度差異變小不等於真值更準。")
 
 # ==================== 【網頁即時成果展示與打包下載區】 ====================
 if st.session_state.analysis_done:
@@ -1933,106 +2139,59 @@ if st.session_state.analysis_done:
             m3.metric("高危害佔比 (AL3/AL4)", f"{high_risk_pct:.1f}%")
             m4.metric("平均視角信賴度", f"{avg_conf:.1f}%")
 
-        st.info("每個成功樣本現在都會輸出關節分數、Score A/B/C/D 與加分欄位；手腕 2D/3D 角度差異過大或超過 60° 時會標記人工複核。ZIP 內另有略過影格診斷 CSV。")
+        st.info("每個成功樣本輸出 Score A/B/C/D、四種手腕角度、幾何品質註記；並保留原始影格（可選）與關鍵點 JSONL 供追查。單鏡頭角度仍是投影估計，尚未建立人體真實量角準確率。")
 
-        v4_show_review_center()
-        v6_show_hand_comparison()
-
-        # 2. 互動式數據報表
-        if mode_now == "左右側同步計算":
-            st.subheader("📊 詳細抽樣數據報表（可切換檢視：雙側對照總表 / 右手獨立表 / 左手獨立表）")
-            tab_comb, tab_r, tab_l = st.tabs(["📋 左右雙側對照總表", "👉 右手側獨立分析表", "👈 左手側獨立分析表"])
-            with tab_comb:
-                st.dataframe(df_show, use_container_width=True)
-            with tab_r:
-                st.dataframe(st.session_state.df_right_only, use_container_width=True)
-            with tab_l:
-                st.dataframe(st.session_state.df_left_only, use_container_width=True)
-        else:
-            st.subheader("📊 詳細抽樣數據報表")
-            st.dataframe(df_show, use_container_width=True)
-
-        # 3. 瀏覽器本地直出 ZIP 下載按鈕
-        st.subheader("📦 匯出完整稽核報告")
-        render_blob_download_button(
-            st.session_state.zip_bytes,
-            st.session_state.zip_filename,
-            f"📥 點此直接下載【{mode_now}】RULA 報表與獨立擷取照片庫 (ZIP)"
+        tab_overview, tab_review, tab_hand, tab_report, tab_photos, tab_export = st.tabs(
+            ["📈 風險總覽", "🔍 異常／人工覆核", "🖐️ 手腕比較", "📋 完整報表", "🖼️ 影格照片", "📦 下載"]
         )
-
-        # 4. Base64 內嵌影像預覽畫廊
-        st.subheader("🖼️ 抽樣標註照片預覽（含五官網格、手掌拇指三角、足底支撐三角與全身雙側骨架）")
-        if mode_now == "左右側同步計算":
-            tab_img_pair, tab_img_r, tab_img_l = st.tabs([
-                "👀 左右鏡頭同步對照檢視",
-                "📸 右手側鏡頭獨立擷取照",
-                "📸 左手側鏡頭獨立擷取照"
-            ])
-            with tab_img_pair:
-                pair_count = min(len(st.session_state.display_right_b64), len(st.session_state.display_left_b64))
-                for idx in range(pair_count):
-                    c_r, c_l = st.columns(2)
-                    cap_r, b64_r = st.session_state.display_right_b64[idx]
-                    cap_l, b64_l = st.session_state.display_left_b64[idx]
-                    with c_r:
-                        st.markdown(
-                            f"""
-                            <div style="text-align:center; margin-bottom:16px; background:#1e1e1e; padding:8px; border-radius:8px;">
-                                <img src="data:image/jpeg;base64,{b64_r}" style="width:100%; border-radius:6px;">
-                                <div style="font-size:13px; color:#ddd; margin-top:6px;">{cap_r}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-                    with c_l:
-                        st.markdown(
-                            f"""
-                            <div style="text-align:center; margin-bottom:16px; background:#1e1e1e; padding:8px; border-radius:8px;">
-                                <img src="data:image/jpeg;base64,{b64_l}" style="width:100%; border-radius:6px;">
-                                <div style="font-size:13px; color:#ddd; margin-top:6px;">{cap_l}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-            with tab_img_r:
-                cols_r = st.columns(3)
-                for idx, (cap_text, b64_str) in enumerate(st.session_state.display_right_b64):
-                    with cols_r[idx % 3]:
-                        st.markdown(
-                            f"""
-                            <div style="text-align:center; margin-bottom:16px; background:#1e1e1e; padding:8px; border-radius:8px;">
-                                <img src="data:image/jpeg;base64,{b64_str}" style="width:100%; border-radius:6px;">
-                                <div style="font-size:13px; color:#ddd; margin-top:6px;">{cap_text}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-            with tab_img_l:
-                cols_l = st.columns(3)
-                for idx, (cap_text, b64_str) in enumerate(st.session_state.display_left_b64):
-                    with cols_l[idx % 3]:
-                        st.markdown(
-                            f"""
-                            <div style="text-align:center; margin-bottom:16px; background:#1e1e1e; padding:8px; border-radius:8px;">
-                                <img src="data:image/jpeg;base64,{b64_str}" style="width:100%; border-radius:6px;">
-                                <div style="font-size:13px; color:#ddd; margin-top:6px;">{cap_text}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-        else:
-            with st.expander("點此展開 / 收合所有抽樣標註照片", expanded=True):
-                gallery_cols = st.columns(3)
-                for idx, (cap_text, b64_str) in enumerate(st.session_state.display_images_b64):
-                    with gallery_cols[idx % 3]:
-                        st.markdown(
-                            f"""
-                            <div style="text-align:center; margin-bottom:16px; background:#1e1e1e; padding:8px; border-radius:8px;">
-                                <img src="data:image/jpeg;base64,{b64_str}" style="width:100%; border-radius:6px;">
-                                <div style="font-size:13px; color:#ddd; margin-top:6px;">{cap_text}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
+        with tab_overview:
+            st.subheader("RULA 動作風險時間軸")
+            st.caption("依影片時間呈現每個取樣點的 RULA 最終分數；這是離散姿勢的時間分布，非時間加權暴露量。")
+            if "時間(秒)" in df_show.columns:
+                series = df_show[["時間(秒)", "最終最高分"]].copy().sort_values("時間(秒)")
+                st.line_chart(series.set_index("時間(秒)"), x_label="時間（秒）", y_label="RULA Grand Score")
+            st.caption("平均分數僅供描述性統計；RULA 評估仍需關注高風險姿勢與工作條件。")
+        with tab_review:
+            v4_show_review_center()
+        with tab_hand:
+            v6_show_hand_comparison()
+        with tab_report:
+            if mode_now == "左右側同步計算":
+                sub_all, sub_r, sub_l = st.tabs(["雙側對照", "右側完整欄位", "左側完整欄位"])
+                with sub_all:
+                    st.dataframe(df_show, use_container_width=True)
+                with sub_r:
+                    st.dataframe(st.session_state.df_right_only, use_container_width=True)
+                with sub_l:
+                    st.dataframe(st.session_state.df_left_only, use_container_width=True)
+            else:
+                st.dataframe(df_show, use_container_width=True)
+            st.caption("CSV 同時保留 Pose2D、Pose3D、Pose混合、Hand2D、各部位分數與品質原因。")
+        with tab_photos:
+            st.subheader("逐影格標記照片")
+            if mode_now == "左右側同步計算":
+                gallery_side = st.radio("顯示的拍攝側", ["右手側", "左手側"], horizontal=True, key="v7_gallery_side")
+                images = st.session_state.display_right_b64 if gallery_side == "右手側" else st.session_state.display_left_b64
+            else:
+                images = st.session_state.display_images_b64
+            if images:
+                selected = st.selectbox("選擇樣本", range(len(images)), format_func=lambda i: images[i][0], key="v7_gallery_pick")
+                caption, payload = images[selected]
+                import html as html_lib
+                components.html(f'<div style="text-align:center;color:#ddd"><img src="data:image/jpeg;base64,{payload}" style="max-width:100%;max-height:750px;border-radius:9px"/><p>{html_lib.escape(caption)}</p></div>', height=790, scrolling=True)
+                if st.checkbox("載入全部照片縮圖（可能增加瀏覽器負擔）", value=False, key="v7_load_all_thumbnails"):
+                    cols = st.columns(3)
+                    for j,(cap_txt,b64_txt) in enumerate(images):
+                        with cols[j % 3]:
+                            components.html(f'<img src="data:image/jpeg;base64,{b64_txt}" style="width:100%;border-radius:5px"/>', height=235)
+                            st.caption(cap_txt)
+            else:
+                st.info("目前沒有可顯示的照片。")
+            st.caption("ZIP 的 Raw_Frames 為未繪製骨架的影格；Diagnostics/Keypoint_Coordinates.jsonl 可對應原始點位。")
+        with tab_export:
+            st.subheader("完整分析與照片匯出")
+            render_blob_download_button(st.session_state.zip_bytes, st.session_state.zip_filename,
+                                        f"📥 下載【{mode_now}】RULA 完整分析 ZIP")
+            st.caption("原始報表、Hand 比較圖、原始影格（若開啟）、關鍵點座標以及跳過樣本均保存在 ZIP。")
     else:
         st.warning("⚠️ 影片中未偵測到有效的人體姿態關鍵點，請確認影片人物是否清晰完整。")
