@@ -1,7 +1,37 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import cv2
-import mediapipe as mp
+
+# Streamlit Cloud 的原生 OpenCV 錯誤可能被平台隱藏。
+# 在載入失敗時，顯示真正缺少的共用函式庫及已安裝的套件版本。
+def _show_native_import_diagnostic(module_name, err):
+    from importlib import metadata
+    import platform
+    import sys
+    st.set_page_config(page_title="RULA v6｜環境相容性檢查", layout="centered")
+    st.error(f"環境初始化失敗：無法載入 {module_name}，RULA 分析尚未開始。")
+    st.info("請複製下方完整錯誤文字，這一行才能確認是缺少系統函式庫，還是 NumPy／OpenCV 版本衝突。")
+    st.code(f"{type(err).__name__}: {err}", language="text")
+    installed = {}
+    for dist in ("mediapipe", "numpy", "opencv-python", "opencv-python-headless",
+                 "opencv-contrib-python", "opencv-contrib-python-headless", "streamlit"):
+        try:
+            installed[dist] = metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            installed[dist] = "未安裝"
+    st.write("Python：", sys.version.split()[0], "；作業系統：", platform.system())
+    st.json(installed, expanded=False)
+    st.warning("這是套件環境錯誤，與上傳影片、手部模型檔或 RULA 評分本身無關。")
+    st.stop()
+
+try:
+    import cv2
+except Exception as exc:
+    _show_native_import_diagnostic("OpenCV (cv2)", exc)
+
+try:
+    import mediapipe as mp
+except Exception as exc:
+    _show_native_import_diagnostic("MediaPipe", exc)
 import math
 import numpy as np
 import pandas as pd
