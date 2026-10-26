@@ -53,7 +53,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Complexity 2 asks MediaPipe to download pose_landmark_heavy.tflite into site-packages,
 # which is typically read-only on hosted deployments.
 POSE_MODEL_COMPLEXITY = 1
-APP_BUILD_TAG = "RULA_V7_WRIST_QC_TABBED_2026-10-25"
+APP_BUILD_TAG = "RULA_V8_WIZARD_REJECT_NECK_2026-10-27"
 
 # ==================== 【沿用 v6 RULA 查表矩陣：仍需標準工作表逐格核對】 ====================
 TABLE_A = {
@@ -818,7 +818,7 @@ def analyze_front_camera(frame, pose_model, target_side):
     ear_left, ear_right = xy(7), xy(8)
     ear_mid = (ear_left + ear_right) * 0.5
     ear_axis = ear_mid - shoulder_mid
-    neck_relative_angle = float(np.degrees(np.arctan2(abs(np.cross(-torso_axis, ear_axis)), max(abs(np.dot(-torso_axis, ear_axis)), 1e-6)))) if np.linalg.norm(ear_axis) >= 5 else 0.0
+    neck_relative_angle = float(np.degrees(np.arctan2(abs(float((-torso_axis)[0]*ear_axis[1]-(-torso_axis)[1]*ear_axis[0])), max(abs(np.dot(-torso_axis, ear_axis)), 1e-6)))) if np.linalg.norm(ear_axis) >= 5 else 0.0
     # 以上都是影像代理規則；不能單憑這些數據宣稱臨床準確。
     mods = {
         "is_abducted": is_abducted,
@@ -975,6 +975,7 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
 
         head_center = ear * 0.6 + visible_eye * 0.4
         ang_neck = abs(180.0 - calculate_2d_angle(hp_center, sh_center, head_center))
+        neck_v8 = v8_neck_candidate(n_lm, work_w, work_h)
 
         # RULA 腿足支撐與平衡需依實際作業情境確認，不再用兩腳高度差猜測。
         lg_score = int(manual_mods.get("leg_score", 2))
@@ -1059,6 +1060,11 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         side_prefix = "右手" if target_side == "右手側" else "左手"
         data = {
             "頸部角度": round(ang_neck, 1),
+            "頸部_v7_原角度": round(ang_neck,1),
+            "頸部_v8_候選角度": neck_v8['angle'],
+            "頸部_v8_候選品質": neck_v8['quality'],
+            "頸部_v8_關鍵點": neck_v8['landmarks'],
+            "頸部_v8_診斷": neck_v8['note'],
             "軀幹角度": round(ang_trunk, 1),
             f"{side_prefix}上臂角度": round(ang_upper_arm, 1),
             f"{side_prefix}前臂角度": round(ang_lower_arm, 1),
@@ -1151,10 +1157,253 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
         return False, None, frame_work, 0.0
 
 
+# ==================== 【後處理：Hand 角度時序孤立尖峰檢查】 ====================
+# 必須先定義，Streamlit 執行分析時才能正常呼叫。
+# 此函式僅新增診斷欄位，不會修改 RULA 分數。
+def add_hand_temporal_notes(df, side):
+    """Post-hoc diagnostic only. Real fast movements are NOT automatically incorrect.
+
+    Only mark a central sample when its two sampled neighbors agree closely, while
+    the central Hand2D reading is distant from both. Does not alter RULA scoring.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy().sort_values("時間(秒)")
+    prefix = "右手" if side == "右手側" else "左手"
+    column = f"{prefix}PoseHand實驗手腕角度"
+    if column not in out:
+        return out
+    values = pd.to_numeric(out[column], errors="coerce").to_numpy(dtype=float)
+    sample_ids = pd.to_numeric(out["樣本編號"], errors="coerce").to_numpy(dtype=float)
+    flags = np.zeros(len(out), dtype=bool)
+    for i in range(1,len(out)-1):
+        if not (np.all(np.isfinite(values[i-1:i+2])) and
+                sample_ids[i]-sample_ids[i-1] == 1 and
+                sample_ids[i+1]-sample_ids[i] == 1):
+            continue
+        if (abs(values[i-1]-values[i+1]) <= 15 and
+            abs(values[i]-values[i-1]) >= 35 and
+            abs(values[i]-values[i+1]) >= 35):
+            flags[i] = True
+    out["Hand時序孤立尖峰（僅供研究）"] = flags
+    return out.sort_index()
+
+
+
+# ==================== 【V8：雙視角頸部品質分析，暫不改動正式 RULA 分數】 ====================
+def v8_neck_candidate(landmarks, width, height):
+    """Returns an experimental 2D neck-to-torso proxy; NOT a calibrated anatomical angle."""
+    lm = landmarks
+    def pt(i):
+        return np.array([float(lm[i].x)*width, float(lm[i].y)*height])
+    def vis(i):
+        return float(getattr(lm[i], "visibility", 0.0) or 0.0)
+    sh_mid = (pt(11)+pt(12))/2.0
+    hip_mid = (pt(23)+pt(24))/2.0
+    torso_up = sh_mid-hip_mid
+    torso_len = float(np.linalg.norm(torso_up))
+    base = {"angle": float('nan'), "quality": 0.0, "landmarks": "", "note": "", "valid": False}
+    if torso_len < 18 or min(vis(i) for i in (11,12,23,24)) < 0.25:
+        base['note'] = '肩髖中心品質不足'
+        return base
+    # Ears are the primary proxy; eyes only refine head direction if visible.
+    ear_ids = [i for i in (7,8) if vis(i) >= .40]
+    eye_ids = [i for i in (2,5) if vis(i) >= .45]
+    if not ear_ids:
+        base['note'] = '耳部關鍵點不可用'
+        return base
+    ear_ids.sort(key=vis, reverse=True)
+    # Using both ears can help frontal projections; not claiming 3D pose recovery.
+    chosen_ears = ear_ids[:2] if len(ear_ids)==2 else ear_ids[:1]
+    ear_center = np.mean([pt(i) for i in chosen_ears], axis=0)
+    quality_values = [vis(i) for i in chosen_ears]
+    selected = [f'耳{i}' for i in chosen_ears]
+    head_center = ear_center
+    if eye_ids:
+        eye_ids.sort(key=vis, reverse=True)
+        chosen_eye = eye_ids[:2] if len(eye_ids)==2 else eye_ids[:1]
+        eye_center = np.mean([pt(i) for i in chosen_eye], axis=0)
+        head_center = .78*ear_center + .22*eye_center
+        quality_values += [vis(i) for i in chosen_eye]
+        selected += [f'眼{i}' for i in chosen_eye]
+    v = head_center - sh_mid
+    ratio = float(np.linalg.norm(v)/max(torso_len,1e-6))
+    base['landmarks'] = ','.join(selected)
+    if ratio < .12 or ratio > 1.0:
+        base['note'] = '頭部－肩中心距離比例異常'
+        return base
+    angle = calculate_2d_angle(hip_mid, sh_mid, head_center)
+    if not np.isfinite(angle):
+        base['note'] = '頸部幾何向量退化'
+        return base
+    quality = min(quality_values+[vis(11),vis(12),vis(23),vis(24)])
+    base.update(angle=round(abs(180.0-angle),2), quality=round(float(quality),3),
+                valid=bool(quality >= .45), note='側視角候選角；尚未量角驗證')
+    return base
+
+
+def v8_neck_cross_view(right, left, max_diff=15.0, min_quality=0.55):
+    """Never force incompatible camera estimates to agree. Candidate is diagnostic only."""
+    try:
+        rv,lv=float(right.get('頸部_v8_候選角度')),float(left.get('頸部_v8_候選角度'))
+        rq,lq=float(right.get('頸部_v8_候選品質',0)),float(left.get('頸部_v8_候選品質',0))
+    except (TypeError,ValueError):
+        return float('nan'), float('nan'), '候選數據不足'
+    if not (np.isfinite(rv) and np.isfinite(lv)):
+        return float('nan'),float('nan'),'任一鏡頭沒有有效候選角'
+    delta=round(abs(rv-lv),2)
+    if rq < min_quality or lq < min_quality:
+        return float('nan'),delta,'候選角品質不足；不融合'
+    if delta > max_diff:
+        return float('nan'),delta,'左右鏡頭差異過大；不融合'
+    return round((rv*rq+lv*lq)/(rq+lq),2),delta,'品質與差異條件通過；僅供對照'
+
+
+def v8_make_rejected_visual(frame, pose_model):
+    """Use actual returned MediaPipe landmarks only. Failures show no fabricated skeleton."""
+    if frame is None or not isinstance(frame,np.ndarray) or frame.size==0:
+        return None,None,0,'影片無可讀取影格',0
+    h,w=frame.shape[:2]
+    scale=min(900.0/max(h,w),1.0)
+    img=cv2.resize(frame,(max(1,int(w*scale)),max(1,int(h*scale)))) if scale<1 else frame.copy()
+    raw_bytes=_encode_preview(img)
+    draw=img.copy()
+    result,quality,method=detect_pose_with_fallback(img,pose_model,required_indices=[7,8,11,12,13,14,15,16,23,24,25,26,27,28])
+    n_points=0
+    if result is not None and getattr(result,'pose_landmarks',None):
+        lm=result.pose_landmarks.landmark
+        hh,ww=draw.shape[:2]
+        good={i for i,p in enumerate(lm) if (float(getattr(p,'visibility',0) or 0)>=.30 and
+            np.isfinite(p.x) and np.isfinite(p.y) and -.1<=p.x<=1.1 and -.1<=p.y<=1.1)}
+        n_points=len(good)
+        for a,b in mp.solutions.pose.POSE_CONNECTIONS:
+            if a in good and b in good:
+                pa=(int(lm[a].x*ww),int(lm[a].y*hh)); pb=(int(lm[b].x*ww),int(lm[b].y*hh))
+                cv2.line(draw,pa,pb,(0,210,255),2,cv2.LINE_AA)
+        for i in good:
+            p=lm[i]
+            cv2.circle(draw,(int(p.x*ww),int(p.y*hh)),4,(0,255,128),-1,cv2.LINE_AA)
+        note=f'Detected partial landmarks: {n_points}/33; method={method}'
+    else:
+        note='No pose landmarks returned; no skeleton drawn'
+    cv2.putText(draw,note[:90],(8,28),cv2.FONT_HERSHEY_SIMPLEX,.48,(255,255,255),2,cv2.LINE_AA)
+    return raw_bytes,_encode_preview(draw),n_points,note,quality
+
+
+def v8_add_rejected_sample(items, photos, sample_id, seconds, side, reason, camera_frames, pose_model):
+    """Save rejected reason AND synchronized raw/diagnostic images for available cameras."""
+    item={"樣本編號":int(sample_id),"時間(秒)":float(seconds),"評估側":side,"拒絕原因":reason,
+          "建議查看鏡頭":"Front" if '正面' in reason else ('Right' if side=='右手側' else 'Left'),
+          "評分狀態":"排除，不自動計入 RULA"}
+    for camera,frame in camera_frames.items():
+        raw,overlay,points,note,quality=v8_make_rejected_visual(frame,pose_model)
+        if raw is None:
+            continue
+        key=f'Sample_{int(sample_id):03d}_{side}_{camera}'
+        photos[key]={"raw":raw,"overlay":overlay,"points":points,"note":note,"quality":float(quality),"camera":camera}
+        item[f'{camera}_原始圖片']=f'Diagnostics/Rejected_Images/{key}_Raw.jpg'
+        item[f'{camera}_診斷圖片']=f'Diagnostics/Rejected_Images/{key}_Attempt.jpg'
+    items.append(item)
+
+
+def v8_zip_rejected_photos(zf, rejected_photos):
+    for key,photos in rejected_photos.items():
+        zf.writestr(f'Diagnostics/Rejected_Images/{key}_Raw.jpg',photos['raw'])
+        zf.writestr(f'Diagnostics/Rejected_Images/{key}_Attempt.jpg',photos['overlay'])
+
+
+def v8_encode_html_image(payload, caption=''):
+    import html
+    if not payload:
+        return '<div style="padding:20px">無可用圖片</div>'
+    return (f'<div style="text-align:center"><img src="data:image/jpeg;base64,{base64.b64encode(payload).decode()}" '
+            f'style="max-width:100%;max-height:540px;border-radius:8px"/><p>{html.escape(caption)}</p></div>')
+
+
+def v8_download_report_zip(original_zip, review_map):
+    """Append manual review statuses without changing automated CSV or scores."""
+    if not original_zip:
+        return b''
+    stream=io.BytesIO(original_zip)
+    with zipfile.ZipFile(stream,'a',zipfile.ZIP_DEFLATED) as archive:
+        rows=[{'樣本側別':k,'人工複核狀態':v} for k,v in sorted(review_map.items())]
+        archive.writestr('Diagnostics/Rejected_Manual_Reviews.csv',
+                         pd.DataFrame(rows,columns=['樣本側別','人工複核狀態']).to_csv(index=False).encode('utf-8-sig'))
+    return stream.getvalue()
+
+
+def v8_show_rejected_center():
+    st.subheader('被剔除樣本：原圖與實際偵測嘗試')
+    st.caption('這裡只顯示被排除的樣本；兩張圖來自相同時間與鏡頭，右圖為事後重新執行模型得到的診斷結果。標記人工狀態不會自動恢復 RULA 評分。')
+    records=st.session_state.get('v8_rejected_rows',[])
+    photos=st.session_state.get('v8_rejected_photos',{})
+    if not records:
+        st.success('此次沒有剔除樣本。')
+        return
+    st.metric('剔除紀錄數（側別）',len(records))
+    labels=[f"第{r['樣本編號']}筆｜{r['時間(秒)']}秒｜{r['評估側']}｜{r['拒絕原因']}" for r in records]
+    idx=st.selectbox('選擇紀錄',range(len(records)),format_func=lambda i:labels[i],key='v8_rejected_pick')
+    item=records[idx]
+    available=[camera for camera in ('Front','Right','Left')
+               if f"Sample_{item['樣本編號']:03d}_{item['評估側']}_{camera}" in photos]
+    if not available:
+        st.warning('影片讀取失敗，沒有可用的原始影格。')
+    else:
+        preferred=item.get('建議查看鏡頭','Front')
+        camera=st.radio('選擇鏡頭（預設失敗來源）',available,index=available.index(preferred) if preferred in available else 0,
+                        horizontal=True,key=f"v8_rejected_camera_{item['樣本編號']}_{item['評估側']}")
+        img=photos[f"Sample_{item['樣本編號']:03d}_{item['評估側']}_{camera}"]
+        a,b=st.columns(2)
+        with a:
+            st.markdown('**未渲染原始照片**')
+            components.html(v8_encode_html_image(img['raw']),height=590,scrolling=True)
+        with b:
+            st.markdown('**系統重新偵測（可能只有局部）**')
+            components.html(v8_encode_html_image(img['overlay']),height=590,scrolling=True)
+        st.caption(f"有效繪製點：{img['points']}/33；偵測品質代理值：{img['quality']:.2f}；{img['note']}")
+    st.warning('拒絕原因：'+str(item['拒絕原因']))
+    key=f"{item['樣本編號']}_{item['評估側']}"
+    st.session_state.setdefault('v8_manual_rejected',{})
+    options=['尚未複核','需要人工量測','照片可辨識，但不恢復自動評分','確認無法辨識']
+    initial=st.session_state.v8_manual_rejected.get(key,'尚未複核')
+    mark=st.selectbox('人工檢查註記（不影響自動 RULA 分數）',options,index=options.index(initial),key='v8_reject_status_'+key)
+    st.session_state.v8_manual_rejected[key]=mark
+    st.caption('人工註記會加入最終 ZIP 的 Diagnostics/Rejected_Manual_Reviews.csv。')
+
+
+def v8_show_neck_center():
+    st.subheader('頸部角度：左右鏡頭品質與候選估測')
+    st.caption('v8 候選角與左右差異是實驗診斷，不會直接改寫原始 RULA 頸部分數。')
+    df=st.session_state.get('df_records')
+    if df is None or df.empty:
+        st.info('目前沒有可用的有效分析資料。')
+        return
+    if st.session_state.get('analyzed_mode')=='左右側同步計算':
+        cols=[c for c in ['樣本編號','時間(秒)','頸部角度','右側頸部原角度','左側頸部原角度',
+              '頸部_v8_右側候選','頸部_v8_左側候選','頸部_v8_右側品質','頸部_v8_左側品質',
+              '頸部_v8_候選差值','頸部_v8_候選融合角','頸部_v8_融合說明'] if c in df.columns]
+        st.dataframe(df[cols],use_container_width=True,hide_index=True)
+        if '頸部_v8_候選差值' in df.columns:
+            gaps=pd.to_numeric(df['頸部_v8_候選差值'],errors='coerce')
+            st.metric('候選左右差異中位數',f'{gaps.median():.1f}°' if gaps.notna().any() else '無足夠資料')
+            st.line_chart(df.set_index('時間(秒)')[[c for c in ('右側頸部原角度','左側頸部原角度','頸部_v8_右側候選','頸部_v8_左側候選') if c in df.columns]])
+    else:
+        cols=[c for c in ['樣本編號','時間(秒)','頸部角度','頸部_v8_候選角度','頸部_v8_候選品質','頸部_v8_關鍵點','頸部_v8_診斷'] if c in df.columns]
+        st.dataframe(df[cols],use_container_width=True,hide_index=True)
+    st.info('左右差異變小 ≠ 接近人體真值。建議以人工參考角度驗證候選公式後，才考慮用於正式 RULA 計分。')
+
 # ==================== 【Streamlit 網頁應用介面】 ====================
 st.set_page_config(page_title="RULA 三視角人因工程 AI 評估系統", layout="wide")
-st.title("RULA 姿勢危害評估系統")
+st.title("RULA 智慧姿勢評估｜逐步操作")
 st.caption(f"部署版本：{APP_BUILD_TAG}｜執行檔：{os.path.basename(__file__)}｜MediaPipe Pose complexity={POSE_MODEL_COMPLEXITY}")
+
+# 啟動自檢：顯示實際部署版本並在分析前確認時序檢查函式已可呼叫。
+# Streamlit 會在每次互動時由上到下重跑，因此函式必須在此之前宣告。
+if not callable(globals().get("add_hand_temporal_notes")):
+    st.error("部署自檢失敗：add_hand_temporal_notes 未完成定義。請檢查 GitHub 上傳的 222.py 是否完整。")
+    st.stop()
+st.caption("✅ RULA v8：導航、剔除影格診斷與頸部候選比較已載入。")
+
 st.markdown(
     "> **系統說明**：本工具以 MediaPipe Pose 關鍵點估算部分姿勢角度，遇到關鍵點可見度不足時會嘗試原圖、對比增強及放大圖；仍不可靠的樣本會略過。RULA 部分影像補正可選擇自動判讀；手腕扭轉、腿足支撐、聳肩、上臂支撐及扭轉等項目仍需人工確認，輸出仍須由受訓評估者複核，不應單獨作為醫療或職安決策依據。"
 )
@@ -1177,102 +1426,200 @@ if "analysis_done" not in st.session_state:
     st.session_state.hand_review_images = {}
     st.session_state.hand_model_status = "未執行"
 
-# 分頁只整理介面，所有欄位與後續計分變數仍使用原有流程。
-st.caption("操作方式：先設定影片與基本參數；其餘辨識、人工條件及 Hand 實驗可按需要切換分頁設定。")
-setup_basic, setup_auto, setup_manual, setup_hand = st.tabs(
-    ["🎬 影片與基本設定", "🤖 自動辨識條件", "🧍 人工確認（必要）", "🖐️ Hand 實驗"]
-)
-with setup_basic:
-    # 讓使用者選擇單側評估，或三鏡頭左右同步分開計算
-    eval_mode = st.radio(
-        "請選擇本次作業分析之【評估模式】:",
-        options=[
-            "右手側",
-            "左手側",
-            "左右側同步計算 (需上傳正面、右手側、左手側三個視角影片)"
-        ],
-        index=0,
-        horizontal=True,
-        help="選取單側時需上傳「正面 + 該側鏡頭」；選取「左右側同步計算」時，三個鏡頭影片皆須上傳，系統將針對左右手分開計算、分析與擷取。"
-    )
-
-    st.subheader("上傳視角影片")
-    col_front, col_right, col_left = st.columns(3)
-
-    with col_front:
-        vid_front_file = st.file_uploader("1. 正面鏡頭 (必填: 判定外展/交叉/側傾)", type=['mp4', 'mov', 'avi'])
-    with col_right:
-        vid_right_file = st.file_uploader("2. 右手側鏡頭 (量測並擷取右手側動作)", type=['mp4', 'mov', 'avi'])
-    with col_left:
-        vid_left_file = st.file_uploader("3. 左手側鏡頭 (量測並擷取左手側動作)", type=['mp4', 'mov', 'avi'])
-
-    st.subheader("抽樣與負重設定")
-    col_p1, col_p2, col_p3 = st.columns(3)
-    with col_p1:
-        num_samples = st.slider("等距抽樣張數", min_value=5, max_value=100, value=25)
-    with col_p2:
-        combo_muscle = st.selectbox("肌肉使用分數 (Muscle Score):", ["0: 非靜態且動作少於每分鐘 4 次", "1: 姿勢維持超過 1 分鐘或動作每分鐘至少 4 次"])
-    with col_p3:
-        combo_force = st.selectbox("負載與施力 (Force/Load):", ["0: < 2kg (間歇施力)", "1: 2-10kg (間歇施力)", "2: 2-10kg 靜態／重複施力", "3: >10kg 負載、重複施力或衝擊力"])
+# ==================== 【V8：一步一頁流程，設定另存不會在切頁時消失】 ====================
+V8_STEPS=[
+    "1｜影片與基本設定", "2｜自動辨識設定", "3｜人工條件", "4｜Hand 實驗設定",
+    "5｜啟動分析", "6｜風險總覽", "7｜剔除樣本複核", "8｜頸部品質比較",
+    "9｜手腕演算法比較", "10｜異常與人工修正", "11｜影格照片", "12｜完整報表與下載"
+]
+if 'v8_page_index' not in st.session_state:
+    st.session_state.v8_page_index=0
+st.session_state.setdefault('v8_values',{})
+st.session_state.setdefault('v8_uploads',{})
+st.session_state.setdefault('v8_rejected_rows',[])
+st.session_state.setdefault('v8_rejected_photos',{})
+st.session_state.setdefault('v8_manual_rejected',{})
 
 
-with setup_auto:
-    st.subheader("自動辨識設定")
-    st.caption("逐項選擇是否使用影像向量自動判斷；未勾選者由使用者手動設定。影像判斷為代理演算法，遮擋、轉身或不同步可能影響結果。")
-    AUTO_FLAGS = {
-        "is_abducted": "上臂外展（正面肩肘相對位置）",
-        "is_across_midline": "前臂跨越身體中線（正面向量投影）",
-        "is_out_to_side": "前臂向外側工作（正面位置）",
-        "is_side_bending": "軀幹側彎（肩髖中心線）",
-        "is_neck_side_bending": "頸部側彎（頭頸相對軀幹）",
-        "upper_arm_extended": "上臂向後伸展（側面朝向判斷；實驗性）",
-    }
-    auto_selection = {}
-    manual_front = {}
-    front_labels = {
-        "is_abducted": "上臂外展（+1）",
-        "is_across_midline": "前臂跨中線（+1）",
-        "is_out_to_side": "前臂向外側工作（+1）",
-        "is_side_bending": "軀幹側彎（+1）",
-        "is_neck_side_bending": "頸部側彎（+1）",
-    }
-    with st.container():
-        auto_cols = st.columns(2)
-        for pos, (flag, caption) in enumerate(AUTO_FLAGS.items()):
-            with auto_cols[pos % 2]:
-                auto_selection[flag] = st.checkbox("自動辨識｜" + caption, value=(flag != "upper_arm_extended"), key="v5_auto_"+flag)
-        with st.expander("手動判斷：僅顯示未啟用自動辨識的條件", expanded=True):
-            for flag, caption in front_labels.items():
-                if not auto_selection[flag]:
-                    mc1, mc2 = st.columns(2)
-                    with mc1:
-                        manual_front[("右手側", flag)] = st.checkbox("右側｜" + caption, value=False, key="v5_manual_right_"+flag)
-                    with mc2:
-                        manual_front[("左手側", flag)] = st.checkbox("左側｜" + caption, value=False, key="v5_manual_left_"+flag)
+def v8_save_value(name):
+    st.session_state.v8_values[name]=st.session_state.get('_v8_field_'+name)
 
-with setup_manual:
-    st.subheader("仍需人工輸入的項目")
-    st.caption("以下項目不能單靠 33 點 Pose 可靠判定，包括實際受力、支撐及前臂旋轉；本版保留人工選項。未啟用上臂後伸自動判斷時，亦由使用者自行勾選。")
-    mod_col_a, mod_col_b, mod_col_c = st.columns(3)
-    with mod_col_a:
-        leg_support_choice = st.selectbox("腿與足部支撐／平衡（必選）", ["請先目視確認…", "腿足受支撐且平衡（1分）", "腿足未受支撐或不平衡（2分）"], index=0)
-        neck_twisted_manual = st.checkbox("頸部有扭轉（+1）", value=False)
-        neck_extended_manual = st.checkbox("頸部後仰／伸展", value=False)
-        trunk_twisted_manual = st.checkbox("軀幹有扭轉（+1）", value=False)
-        trunk_extended_manual = st.checkbox("軀幹向後伸展", value=False)
-    with mod_col_b:
-        right_wrist_twist_choice = st.selectbox("右手腕扭轉（必選）", ["請先目視確認…", "中間範圍（1分）", "接近旋轉極限（2分）"], index=0)
-        right_wrist_deviated = st.checkbox("右手腕尺偏／橈偏（+1）", value=False)
-        right_shoulder_raised = st.checkbox("右肩抬高／聳肩（+1）", value=False)
-        right_arm_supported = st.checkbox("右上臂有支撐（-1）", value=False)
-        right_arm_extended = st.checkbox("右上臂後伸超過 20°（人工輸入／辨識不明時備用）", value=False)
-    with mod_col_c:
-        left_wrist_twist_choice = st.selectbox("左手腕扭轉（必選）", ["請先目視確認…", "中間範圍（1分）", "接近旋轉極限（2分）"], index=0)
-        left_wrist_deviated = st.checkbox("左手腕尺偏／橈偏（+1）", value=False)
-        left_shoulder_raised = st.checkbox("左肩抬高／聳肩（+1）", value=False)
-        left_arm_supported = st.checkbox("左上臂有支撐（-1）", value=False)
-        left_arm_extended = st.checkbox("左上臂後伸超過 20°（人工輸入／辨識不明時備用）", value=False)
 
+def v8_value(name, default):
+    return st.session_state.v8_values.setdefault(name,default)
+
+
+def v8_widget(fun, label, name, default, **kwargs):
+    v8_value(name, default)
+    wkey='_v8_field_'+name
+    if wkey not in st.session_state:
+        st.session_state[wkey]=st.session_state.v8_values[name]
+    result=getattr(st,fun)(label,key=wkey,on_change=v8_save_value,args=(name,),**kwargs)
+    return result
+
+
+def v8_upload_on_change(name):
+    st.session_state.v8_uploads[name]=st.session_state.get('_v8_uploader_'+name)
+
+
+def v8_upload(label, name):
+    uploaded=st.file_uploader(label,type=['mp4','mov','avi'],key='_v8_uploader_'+name,
+                              on_change=v8_upload_on_change,args=(name,))
+    saved=st.session_state.v8_uploads.get(name)
+    if uploaded is not None and saved is not uploaded:
+        saved=uploaded
+        st.session_state.v8_uploads[name]=uploaded
+    if saved is not None:
+        st.caption('已暫存：'+str(saved.name)+'（切換步驟不會清除）')
+        if st.button('清除這支影片',key='v8_clear_'+name):
+            st.session_state.v8_uploads[name]=None
+            st.rerun()
+    return saved
+
+
+def v8_go(delta):
+    st.session_state.v8_page_index=max(0,min(len(V8_STEPS)-1,st.session_state.v8_page_index+delta))
+
+
+def v8_jump():
+    st.session_state.v8_page_index=V8_STEPS.index(st.session_state['_v8_jump_select'])
+
+st.session_state['_v8_jump_select']=V8_STEPS[st.session_state.v8_page_index]
+with st.sidebar:
+    st.markdown('### RULA v8 導覽')
+    st.selectbox('快速跳轉',V8_STEPS,key='_v8_jump_select',on_change=v8_jump)
+    st.caption('設定保存在目前瀏覽器工作階段；重新開啟網站須重新上傳影片。')
+
+nav_c1,nav_c2,nav_c3=st.columns([1,4,1])
+with nav_c1:
+    st.button('← 上一步',disabled=st.session_state.v8_page_index==0,
+              use_container_width=True,key='v8_prev_top',on_click=v8_go,args=(-1,))
+with nav_c2:
+    st.progress((st.session_state.v8_page_index+1)/len(V8_STEPS))
+    st.markdown(f"<div style='text-align:center;font-weight:650'>{V8_STEPS[st.session_state.v8_page_index]}</div>",unsafe_allow_html=True)
+with nav_c3:
+    st.button('下一步 →',disabled=st.session_state.v8_page_index==len(V8_STEPS)-1,
+              use_container_width=True,key='v8_next_top',on_click=v8_go,args=(1,))
+
+# 重要：參數與上傳檔案無論目前顯示哪個步驟，皆從非 widget 的永久狀態讀取。
+EVAL_OPTIONS=['右手側','左手側','左右側同步計算 (需上傳正面、右手側、左手側三個視角影片)']
+MUSCLE_OPTIONS=['0: 非靜態且動作少於每分鐘 4 次','1: 姿勢維持超過 1 分鐘或動作每分鐘至少 4 次']
+FORCE_OPTIONS=['0: < 2kg (間歇施力)','1: 2-10kg (間歇施力)','2: 2-10kg 靜態／重複施力','3: >10kg 負載、重複施力或衝擊力']
+LEG_OPTIONS=['請先目視確認…','腿足受支撐且平衡（1分）','腿足未受支撐或不平衡（2分）']
+TWIST_OPTIONS=['請先目視確認…','中間範圍（1分）','接近旋轉極限（2分）']
+AUTO_FLAGS={
+    'is_abducted':'上臂外展（正面肩肘相對位置）',
+    'is_across_midline':'前臂跨越身體中線（正面向量投影）',
+    'is_out_to_side':'前臂向外側工作（正面位置）',
+    'is_side_bending':'軀幹側彎（肩髖中心線）',
+    'is_neck_side_bending':'頸部側彎（頭頸相對軀幹）',
+    'upper_arm_extended':'上臂向後伸展（側面朝向判斷；實驗性）',
+}
+front_labels={
+    'is_abducted':'上臂外展（+1）',
+    'is_across_midline':'前臂跨中線（+1）',
+    'is_out_to_side':'前臂向外側工作（+1）',
+    'is_side_bending':'軀幹側彎（+1）',
+    'is_neck_side_bending':'頸部側彎（+1）',
+}
+for flag in AUTO_FLAGS:
+    v8_value('auto_'+flag,flag!='upper_arm_extended')
+for flag in front_labels:
+    for side in ('右手側','左手側'):
+        v8_value('manual_'+side+'_'+flag,False)
+auto_selection={flag:v8_value('auto_'+flag,flag!='upper_arm_extended') for flag in AUTO_FLAGS}
+manual_front={(side,flag):v8_value('manual_'+side+'_'+flag,False)
+              for side in ('右手側','左手側') for flag in front_labels}
+
+# Defaults for all settings, even when their page isn't active.
+eval_mode=v8_value('eval_mode',EVAL_OPTIONS[0])
+num_samples=v8_value('num_samples',25)
+combo_muscle=v8_value('muscle',MUSCLE_OPTIONS[0])
+combo_force=v8_value('force',FORCE_OPTIONS[0])
+vid_front_file=st.session_state.v8_uploads.get('front')
+vid_right_file=st.session_state.v8_uploads.get('right')
+vid_left_file=st.session_state.v8_uploads.get('left')
+leg_support_choice=v8_value('leg',LEG_OPTIONS[0])
+neck_twisted_manual=v8_value('neck_twisted',False)
+neck_extended_manual=v8_value('neck_extended',False)
+trunk_twisted_manual=v8_value('trunk_twisted',False)
+trunk_extended_manual=v8_value('trunk_extended',False)
+right_wrist_twist_choice=v8_value('rw_twist',TWIST_OPTIONS[0])
+left_wrist_twist_choice=v8_value('lw_twist',TWIST_OPTIONS[0])
+right_wrist_deviated=v8_value('rw_deviated',False)
+left_wrist_deviated=v8_value('lw_deviated',False)
+right_shoulder_raised=v8_value('rs_raised',False)
+left_shoulder_raised=v8_value('ls_raised',False)
+right_arm_supported=v8_value('ra_supported',False)
+left_arm_supported=v8_value('la_supported',False)
+right_arm_extended=v8_value('ra_extended',False)
+left_arm_extended=v8_value('la_extended',False)
+v6_enable_hand=v8_value('hand_enabled',True)
+v6_policy_label=v8_value('hand_policy','安全比較模式：RULA 維持 Pose v5 計分')
+raw_image_export=v8_value('raw_export',True)
+
+page=st.session_state.v8_page_index
+if page == 0:
+    st.subheader('上傳影片與作業設定')
+    eval_mode=v8_widget('radio','評估模式','eval_mode',EVAL_OPTIONS[0],options=EVAL_OPTIONS,horizontal=True)
+    a,b,c=st.columns(3)
+    with a: vid_front_file=v8_upload('正面鏡頭（必要）','front')
+    with b: vid_right_file=v8_upload('右側鏡頭','right')
+    with c: vid_left_file=v8_upload('左側鏡頭','left')
+    d,e,f=st.columns(3)
+    with d: num_samples=v8_widget('slider','抽樣數量','num_samples',25,min_value=5,max_value=100)
+    with e: combo_muscle=v8_widget('selectbox','肌肉使用加分','muscle',MUSCLE_OPTIONS[0],options=MUSCLE_OPTIONS)
+    with f: combo_force=v8_widget('selectbox','負重施力加分','force',FORCE_OPTIONS[0],options=FORCE_OPTIONS)
+    st.caption('不同影片以各自的 FPS 對應共同時間戳；目前仍假設三台攝影機同時起錄。')
+
+elif page == 1:
+    st.subheader('自動辨識條件')
+    st.caption('勾選表示使用影像向量代理判斷；取消後會顯示右側／左側的手動勾選。')
+    cols=st.columns(2)
+    for i,(flag,label) in enumerate(AUTO_FLAGS.items()):
+        with cols[i%2]:
+            auto_selection[flag]=v8_widget('checkbox',label,'auto_'+flag,flag!='upper_arm_extended')
+    with st.expander('僅設定未自動判斷的項目',expanded=True):
+        for flag,label in front_labels.items():
+            if not auto_selection[flag]:
+                a,b=st.columns(2)
+                with a: manual_front[('右手側',flag)]=v8_widget('checkbox','右側｜'+label,'manual_右手側_'+flag,False)
+                with b: manual_front[('左手側',flag)]=v8_widget('checkbox','左側｜'+label,'manual_左手側_'+flag,False)
+    st.caption('影像估測值並不是臨床量測精度；正面鏡頭關鍵點不足時，啟用自動辨識的樣本會被略過。')
+
+elif page == 2:
+    st.subheader('人工確認條件（必要項）')
+    st.caption('影像無法確認實際負重、支撐或前臂旋轉時，仍需輸入。以下會套用整段影片。')
+    a,b,c=st.columns(3)
+    with a:
+        leg_support_choice=v8_widget('selectbox','腿足支撐／平衡','leg',LEG_OPTIONS[0],options=LEG_OPTIONS)
+        neck_twisted_manual=v8_widget('checkbox','頸部扭轉（+1）','neck_twisted',False)
+        neck_extended_manual=v8_widget('checkbox','頸部後仰','neck_extended',False)
+        trunk_twisted_manual=v8_widget('checkbox','軀幹扭轉（+1）','trunk_twisted',False)
+        trunk_extended_manual=v8_widget('checkbox','軀幹向後伸展','trunk_extended',False)
+    with b:
+        st.markdown('**右手側**')
+        right_wrist_twist_choice=v8_widget('selectbox','右腕扭轉','rw_twist',TWIST_OPTIONS[0],options=TWIST_OPTIONS)
+        right_wrist_deviated=v8_widget('checkbox','右腕尺／橈偏','rw_deviated',False)
+        right_shoulder_raised=v8_widget('checkbox','右肩抬高','rs_raised',False)
+        right_arm_supported=v8_widget('checkbox','右臂有支撐','ra_supported',False)
+        right_arm_extended=v8_widget('checkbox','右臂向後伸展（手動備用）','ra_extended',False)
+    with c:
+        st.markdown('**左手側**')
+        left_wrist_twist_choice=v8_widget('selectbox','左腕扭轉','lw_twist',TWIST_OPTIONS[0],options=TWIST_OPTIONS)
+        left_wrist_deviated=v8_widget('checkbox','左腕尺／橈偏','lw_deviated',False)
+        left_shoulder_raised=v8_widget('checkbox','左肩抬高','ls_raised',False)
+        left_arm_supported=v8_widget('checkbox','左臂有支撐','la_supported',False)
+        left_arm_extended=v8_widget('checkbox','左臂向後伸展（手動備用）','la_extended',False)
+
+elif page == 3:
+    st.subheader('Pose + Hand 實驗設定')
+    v6_enable_hand=v8_widget('checkbox','啟用 Hand Landmarker（21 點／手）','hand_enabled',True)
+    v6_policy_label=v8_widget('radio','手腕評分來源','hand_policy','安全比較模式：RULA 維持 Pose v5 計分',
+        options=['安全比較模式：RULA 維持 Pose v5 計分','實驗計分模式：幾何品質達標才採 Hand 角度（研究用途）'],
+        disabled=not v6_enable_hand)
+    raw_image_export=v8_widget('checkbox','ZIP 保存未繪製骨架的原始影格','raw_export',True)
+    st.info('建議選「安全比較」；Hand 2D 估測與 Pose 3D 不可直接當作已校準的共同 3D 角度。')
 
 def build_manual_mods(side_name):
     is_right = side_name == "右手側"
@@ -1299,22 +1646,21 @@ def manual_front_fallback():
         return None
     return {key: False for key in front_keys}
 
-# ==================== 【V6：Pose + Hand 實驗設定】 ====================
-with setup_hand:
-    st.subheader("Pose + Hand 手腕實驗")
-    st.caption("預設只比較、不改變 v5 RULA 分數。Hand Landmarker 的 21 個關鍵點提供額外手掌資訊；Hand World 不是 Pose World 的共同座標系。")
-    v6_enable_hand = st.checkbox("啟用 Hand Landmarker 手腕實驗", value=True, key="v6_enable_hand")
-    v6_policy_label = st.radio(
-        "手腕 RULA 計分來源",
-        ["安全比較模式：RULA 維持 Pose v5 計分", "實驗計分模式：幾何品質達標才採 Hand 角度（研究用途）"],
-        index=0, horizontal=False, disabled=not v6_enable_hand, key="v6_scoring_policy",
-    )
-    v6_hand_policy = "gated" if v6_enable_hand and v6_policy_label.startswith("實驗") else "compare"
-    st.caption("實驗模式也不會自動評定前臂旋前／旋後、負重或真實受力。未辨識到手、手腕點不匹配或兩演算法差異太大時，會自動退回 Pose。")
-    raw_image_export = st.checkbox("ZIP 一起保存未繪圖原始影格（便於角度核對）", value=True, key="v7_raw_frames")
+
+# 在非設定頁也必須由保存的資料建立每次分析的選項。
+v6_hand_policy='gated' if v6_enable_hand and v6_policy_label.startswith('實驗') else 'compare'
+if page == 4:
+    st.subheader('啟動分析')
+    ready_files=[name for name,f in [('正面',vid_front_file),('右側',vid_right_file),('左側',vid_left_file)] if f]
+    st.write('**已上傳：**'+('、'.join(ready_files) if ready_files else '尚未上傳影片'))
+    st.write(f'**抽樣數：**{num_samples}　｜　**分析模式：**{eval_mode}　｜　**Hand：**'+('開啟' if v6_enable_hand else '關閉'))
+    if leg_support_choice==LEG_OPTIONS[0] or any((right_wrist_twist_choice if side=='右手側' else left_wrist_twist_choice)==TWIST_OPTIONS[0]
+         for side in (('右手側','左手側') if eval_mode.startswith('左右側') else (eval_mode,))):
+        st.warning('請先返回「人工條件」填妥腿足支撐、所選側別的手腕扭轉，才能開始分析。')
+    st.caption('執行後自動跳到結果總覽；原本的三視角分析及 ZIP 報表功能皆保留。')
 
 # 執行分析按鈕
-if st.button("🚀 啟動全關節生物力學分析", type="primary", use_container_width=True):
+if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="primary", use_container_width=True):
     is_dual_mode = eval_mode.startswith("左右側同步計算")
 
     # 嚴格檢查影片上傳完整性
@@ -1348,6 +1694,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
         st.session_state.display_left_b64 = []
         st.session_state.zip_bytes = None
         st.session_state.hand_review_images = {}
+        st.session_state.v8_rejected_rows = []
+        st.session_state.v8_rejected_photos = {}
+        st.session_state.v8_manual_rejected = {}
         st.session_state.hand_model_status = "未啟用"
         gc.collect()
 
@@ -1417,6 +1766,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             skipped_right = 0
             skipped_left = 0
             skip_diagnostics = []
+            rejected_rows = []
+            rejected_photos = {}
 
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -1470,9 +1821,15 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         if not succ_r or data_r is None:
                             skipped_right += 1
                             skip_diagnostics.append({"樣本編號": i+1, "時間(秒)": sec, "評估側": "右手側", "可能原因": "正面關鍵點不足" if not front_ok_r else "側面關鍵點不足或角度無效"})
+                            v8_add_rejected_sample(rejected_rows,rejected_photos,i+1,sec,"右手側",
+                                "正面關鍵點不足" if not front_ok_r else "側面關鍵點不足或角度無效",
+                                {"Front":f_frame,"Right":r_frame,"Left":l_frame},pose)
                         if not succ_l or data_l is None:
                             skipped_left += 1
                             skip_diagnostics.append({"樣本編號": i+1, "時間(秒)": sec, "評估側": "左手側", "可能原因": "正面關鍵點不足" if not front_ok_l else "側面關鍵點不足或角度無效"})
+                            v8_add_rejected_sample(rejected_rows,rejected_photos,i+1,sec,"左手側",
+                                "正面關鍵點不足" if not front_ok_l else "側面關鍵點不足或角度無效",
+                                {"Front":f_frame,"Right":r_frame,"Left":l_frame},pose)
 
                         if succ_r and data_r is not None:
                             hand_points_r = data_r.pop("_v6_hand_points", None)
@@ -1532,15 +1889,26 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         if succ_r and succ_l and data_r is not None and data_l is not None:
                             r_g = data_r["右手 Grand Score"]
                             l_g = data_l["左手 Grand Score"]
-                            worst_side = "右手側" if r_g >= l_g else "左手側"
+                            worst_side = "雙側同分" if r_g == l_g else ("右手側" if r_g > l_g else "左手側")
                             final_grand = max(r_g, l_g)
                             final_al = data_r["右手 AL"] if r_g >= l_g else data_l["左手 AL"]
                             overall_conf = round((conf_r + conf_l) / 2.0, 1)
+                            neck_fused,neck_gap,neck_reason = v8_neck_cross_view(data_r,data_l)
 
                             comb_row = {
                                 "樣本編號": i + 1,
                                 "時間(秒)": sec,
                                 "頸部角度": round((data_r["頸部角度"] + data_l["頸部角度"]) / 2.0, 1),
+                                "頸部_v7_舊版平均(僅展示)": round((data_r["頸部角度"]+data_l["頸部角度"])/2,1),
+                                "右側頸部原角度": data_r["頸部角度"],
+                                "左側頸部原角度": data_l["頸部角度"],
+                                "頸部_v8_右側候選": data_r["頸部_v8_候選角度"],
+                                "頸部_v8_左側候選": data_l["頸部_v8_候選角度"],
+                                "頸部_v8_右側品質": data_r["頸部_v8_候選品質"],
+                                "頸部_v8_左側品質": data_l["頸部_v8_候選品質"],
+                                "頸部_v8_候選差值": neck_gap,
+                                "頸部_v8_候選融合角": neck_fused,
+                                "頸部_v8_融合說明": neck_reason,
                                 "軀幹角度": round((data_r["軀幹角度"] + data_l["軀幹角度"]) / 2.0, 1),
                                 "右上臂角度": data_r["右手上臂角度"],
                                 "右前臂角度": data_r["右手前臂角度"],
@@ -1576,6 +1944,10 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         skipped_right += 1
                         skipped_left += 1
                         skip_diagnostics.extend([{"樣本編號": i+1, "時間(秒)": sec, "評估側": side, "可能原因": "影片影格讀取失敗"} for side in ("右手側", "左手側")])
+                        for side in ("右手側","左手側"):
+                            v8_add_rejected_sample(rejected_rows,rejected_photos,i+1,sec,side,
+                                "影片影格讀取失敗",{"Front":f_frame if s_f else None,
+                                "Right":r_frame if s_r else None,"Left":l_frame if s_l else None},pose)
 
                     progress_bar.progress((i + 1) / total_samples)
                     status_text.text(f"左右側獨立擷取與姿態解算進度: {i+1} / {total_samples} 筆完成")
@@ -1593,11 +1965,16 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                 if not df_comb.empty:
                     zf.writestr("RULA_左右同步彙整報表.csv", df_comb.to_csv(index=False).encode('utf-8-sig'))
+                    cols=[c for c in df_comb.columns if c.startswith('頸部_v8_') or c in
+                          ('樣本編號','時間(秒)','右側頸部原角度','左側頸部原角度')]
+                    zf.writestr('Diagnostics/Neck_Comparison.csv',df_comb[cols].to_csv(index=False).encode('utf-8-sig'))
                 if not df_r.empty:
                     zf.writestr("RULA_右手側獨立報表.csv", df_r.to_csv(index=False).encode('utf-8-sig'))
                 if not df_l.empty:
                     zf.writestr("RULA_左手側獨立報表.csv", df_l.to_csv(index=False).encode('utf-8-sig'))
                 zf.writestr("Diagnostics/Skipped_Samples.csv", pd.DataFrame(skip_diagnostics, columns=["樣本編號", "時間(秒)", "評估側", "可能原因"]).to_csv(index=False).encode("utf-8-sig"))
+                zf.writestr("Diagnostics/Rejected_Samples_Detail.csv",pd.DataFrame(rejected_rows).to_csv(index=False).encode('utf-8-sig'))
+                v8_zip_rejected_photos(zf,rejected_photos)
                 for fname, fbytes in zip_right_imgs:
                     zf.writestr(f"右側鏡頭擷取照片/{fname}", fbytes)
                 for fname, fbytes in zip_left_imgs:
@@ -1623,6 +2000,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             st.session_state.display_right_b64 = display_right_b64
             st.session_state.display_left_b64 = display_left_b64
             st.session_state.zip_bytes = zip_buffer.getvalue()
+            st.session_state.v8_rejected_rows = rejected_rows
+            st.session_state.v8_rejected_photos = rejected_photos
             st.session_state.zip_filename = f"RULA_DualSide_Separate_Report_{fixed_time_str}.zip"
             st.session_state.analyzed_mode = "左右側同步計算"
             st.session_state.skipped_info = {"expected": total_samples, "right": skipped_right, "left": skipped_left}
@@ -1670,6 +2049,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             display_images_b64 = []
             skipped_count = 0
             skip_diagnostics = []
+            rejected_rows = []
+            rejected_photos = {}
             
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -1706,6 +2087,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                         if not succ_s or data is None:
                             skipped_count += 1
                             skip_diagnostics.append({"樣本編號": i+1, "時間(秒)": sec, "評估側": target_side, "可能原因": "正面關鍵點不足" if not front_ok else "側面關鍵點不足或角度無效"})
+                            v8_add_rejected_sample(rejected_rows,rejected_photos,i+1,sec,target_side,
+                                "正面關鍵點不足" if not front_ok else "側面關鍵點不足或角度無效",
+                                {"Front":f_frame,"Right" if target_side=="右手側" else "Left":s_frame},pose)
 
                         if succ_s and data is not None:
                             hand_points_s = data.pop("_v6_hand_points", None)
@@ -1745,6 +2129,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                     else:
                         skipped_count += 1
                         skip_diagnostics.append({"樣本編號": i+1, "時間(秒)": sec, "評估側": target_side, "可能原因": "影片影格讀取失敗"})
+                        v8_add_rejected_sample(rejected_rows,rejected_photos,i+1,sec,target_side,
+                            "影片影格讀取失敗",{"Front":f_frame if s_f else None,
+                             "Right" if target_side=="右手側" else "Left":s_frame if s_s else None},pose)
 
                     progress_bar.progress((i + 1) / total_samples)
                     status_text.text(f"全關節姿態解算進度: {i+1} / {total_samples} 筆完成")
@@ -1762,6 +2149,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
                 if not df_result.empty:
                     zf.writestr("RULA_Report.csv", df_result.to_csv(index=False).encode('utf-8-sig'))
                 zf.writestr("Diagnostics/Skipped_Samples.csv", pd.DataFrame(skip_diagnostics, columns=["樣本編號", "時間(秒)", "評估側", "可能原因"]).to_csv(index=False).encode("utf-8-sig"))
+                zf.writestr("Diagnostics/Rejected_Samples_Detail.csv",pd.DataFrame(rejected_rows).to_csv(index=False).encode('utf-8-sig'))
+                v8_zip_rejected_photos(zf,rejected_photos)
                 for fname, fbytes in zip_images:
                     zf.writestr(f"Photos/{fname}", fbytes)
                 for fname, fbytes in zip_hand_imgs:
@@ -1783,6 +2172,8 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             st.session_state.df_records = df_result
             st.session_state.display_images_b64 = display_images_b64
             st.session_state.zip_bytes = zip_buffer.getvalue()
+            st.session_state.v8_rejected_rows = rejected_rows
+            st.session_state.v8_rejected_photos = rejected_photos
             st.session_state.zip_filename = f"RULA_{side_en_tag}_Report_{fixed_time_str}.zip"
             st.session_state.analyzed_mode = target_side
             st.session_state.skipped_info = {"expected": total_samples, "single": skipped_count}
@@ -1793,34 +2184,9 @@ if st.button("🚀 啟動全關節生物力學分析", type="primary", use_conta
             hand_task.close()
         except Exception:
             logging.exception("Hand model close failed")
+    st.session_state.v8_page_index=5
+    st.rerun()
 
-def add_hand_temporal_notes(df, side):
-    """Post-hoc diagnostic only. Real fast movements are NOT automatically incorrect.
-
-    Only mark a central sample when its two sampled neighbors agree closely, while
-    the central Hand2D reading is distant from both. Does not alter RULA scoring.
-    """
-    if df is None or df.empty:
-        return df
-    out = df.copy().sort_values("時間(秒)")
-    prefix = "右手" if side == "右手側" else "左手"
-    column = f"{prefix}PoseHand實驗手腕角度"
-    if column not in out:
-        return out
-    values = pd.to_numeric(out[column], errors="coerce").to_numpy(dtype=float)
-    sample_ids = pd.to_numeric(out["樣本編號"], errors="coerce").to_numpy(dtype=float)
-    flags = np.zeros(len(out), dtype=bool)
-    for i in range(1,len(out)-1):
-        if not (np.all(np.isfinite(values[i-1:i+2])) and
-                sample_ids[i]-sample_ids[i-1] == 1 and
-                sample_ids[i+1]-sample_ids[i] == 1):
-            continue
-        if (abs(values[i-1]-values[i+1]) <= 15 and
-            abs(values[i]-values[i-1]) >= 35 and
-            abs(values[i]-values[i+1]) >= 35):
-            flags[i] = True
-    out["Hand時序孤立尖峰（僅供研究）"] = flags
-    return out.sort_index()
 
 
 # ==================== 【V4：時間異常檢測／逐影格人工複核】 ====================
@@ -1923,8 +2289,9 @@ def v4_show_review_center():
         return
 
     all_checked = pd.concat([v4_mark_anomalies(df, side) for side, df in available.items()], ignore_index=True)
-    t1, t2, t3 = st.tabs(["🚩 異常影格審核中心", "✍️ 逐影格人工修正與重算", "📈 RULA 動作風險時間軸"])
-    with t1:
+    tool = st.radio('目前審核功能', ['🚩 異常影格', '✍️ 人工重新計分', '📈 覆核時間軸'],
+                    horizontal=True, key='v8_review_tool')
+    if tool == '🚩 異常影格':
         flagged = all_checked[all_checked["需要複核"]]
         c1, c2, c3 = st.columns(3)
         c1.metric("有效評估筆數", len(all_checked))
@@ -1968,7 +2335,7 @@ def v4_show_review_center():
         else:
             st.info("此評估側沒有符合條件的影格，可取消勾選警示篩選。")
 
-    with t2:
+    if tool == '✍️ 人工重新計分':
         st.caption("這是可選的人工覆核工具，不影響原始自動分析。僅修改指定樣本的各部位分數，重新查表並保留原始資料。")
         side = st.selectbox("評估側", list(available), key="v4_edit_side")
         df = available[side].sort_values("樣本編號")
@@ -2005,7 +2372,7 @@ def v4_show_review_center():
         else:
             st.info("目前沒有人工修正，原始分數維持不變。")
 
-    with t3:
+    if tool == '📈 覆核時間軸':
         st.caption("以每個影格的原始 RULA Grand Score 繪製；如有人工修正，另以修正後分數作比較。時間間距依影片取樣而定。")
         side = st.selectbox("時間軸評估側", list(available), key="v4_chart_side")
         series = available[side].sort_values("時間(秒)").copy()
@@ -2061,6 +2428,19 @@ def v6_show_hand_comparison():
     c4.metric("側面 Pose 中位耗時", f"{df[pose_ms_col].median():.0f} ms" if df[pose_ms_col].notna().any() else "未執行")
     c5.metric("Hand 中位耗時", f"{df[time_col].median():.0f} ms" if df[time_col].notna().any() else "未執行")
     st.caption("耗時數值是在本次 Streamlit 執行環境實測，並非模型官方效能；Pose 欄只計側面 Pose 偵測（含重試），不包含前鏡頭偵測／骨架繪圖。")
+    with st.expander('Hand 匹配失敗與品質問題統計（研究診斷）',expanded=False):
+        reason_column=f"{prefix}Hand品質原因"
+        matched_column=f"{prefix}Hand匹配成功"
+        pass_column=f"{prefix}Hand品質通過"
+        a1,a2,a3=st.columns(3)
+        a1.metric('成功匹配',int(df[matched_column].fillna(False).sum()))
+        a2.metric('品質通過',int(df[pass_column].fillna(False).sum()))
+        a3.metric('待檢查',int((~df[pass_column].fillna(False).astype(bool)).sum()))
+        if reason_column in df.columns:
+            causes=df[reason_column].fillna('未記錄').astype(str).value_counts().rename_axis('品質說明').reset_index(name='筆數')
+            st.dataframe(causes,use_container_width=True,hide_index=True)
+        st.caption('這些是幾何品質判斷與模型匹配情況，不是 Hand 或 Pose 的量測準確率。')
+
     ids = df["樣本編號"].astype(int).tolist()
     chosen = st.selectbox("選取影格查看兩版結果（可選 9、25、42 等）", ids,
                           index=ids.index(9) if 9 in ids else 0, key="v6_hand_sample")
@@ -2096,102 +2476,99 @@ def v6_show_hand_comparison():
     st.line_chart(graph, x_label="影片時間（秒）", y_label="手腕角度代理值（度）")
     st.caption("公平比較以 Pose 2D 與 Hand 2D 為主；Pose 混合保留供回歸測試。角度差異變小不等於真值更準。")
 
-# ==================== 【網頁即時成果展示與打包下載區】 ====================
-if st.session_state.analysis_done:
-    st.divider()
-    mode_now = st.session_state.analyzed_mode
-    st.success(f"✅ 【{mode_now}】姿態分析流程完成！以下為即時分析結果：")
-    skipped_info = st.session_state.get("skipped_info", {})
-    if mode_now == "左右側同步計算":
-        skipped_r = int(skipped_info.get("right", 0))
-        skipped_l = int(skipped_info.get("left", 0))
-        if skipped_r or skipped_l:
-            st.warning(f"有樣本因影片讀取失敗或關鍵點品質不足而略過：右側 {skipped_r}/{skipped_info.get('expected', '?')}，左側 {skipped_l}/{skipped_info.get('expected', '?')}。略過的樣本不會自動補成低分，請調整拍攝或改用人工評估。")
+# ==================== 【V8：結果區改為一次只顯示一頁】 ====================
+if page >= 5:
+    if not st.session_state.analysis_done:
+        st.info('還沒有分析結果。請先到「1｜影片與基本設定」上傳影片，再到「5｜啟動分析」完成計算。')
+        if st.button('前往上傳影片',key='v8_go_upload'):
+            st.session_state.v8_page_index=0
+            st.rerun()
     else:
-        skipped_n = int(skipped_info.get("single", 0))
-        if skipped_n:
-            st.warning(f"有 {skipped_n}/{skipped_info.get('expected', '?')} 個抽樣點因影片讀取失敗或關鍵點品質不足而略過；略過的樣本不會自動補成低分，請調整拍攝或改用人工評估。")
-    
-    df_show = st.session_state.df_records
-    
-    if df_show is not None and not df_show.empty:
-        # 1. 核心人因指標看板
-        st.subheader("📈 RULA 危害指標總覽")
-        st.caption("視角信賴度為本系統所用關鍵點的平均 visibility 指標，並非 RULA 正確率或經驗證的統計信賴區間。請同時檢查逐張標註影像及漏判樣本。")
-        avg_score = df_show["最終最高分"].mean()
-        max_score = df_show["最終最高分"].max()
-        high_risk_pct = (df_show["最終最高分"] >= 5).mean() * 100
-
-        if mode_now == "左右側同步計算":
-            r_avg = df_show["右手 Grand Score"].mean()
-            l_avg = df_show["左手 Grand Score"].mean()
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("最終平均最高分", f"{avg_score:.2f} 分")
-            m2.metric("右手獨立平均總分", f"{r_avg:.2f} 分")
-            m3.metric("左手獨立平均總分", f"{l_avg:.2f} 分")
-            m4.metric("最高風險峰值", f"{max_score} 分")
-            m5.metric("高危害佔比 (AL3/AL4)", f"{high_risk_pct:.1f}%")
-        else:
-            avg_conf = df_show["視角信賴度(%)"].mean()
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("平均 RULA 總分", f"{avg_score:.2f} 分")
-            m2.metric("最高風險峰值", f"{max_score} 分")
-            m3.metric("高危害佔比 (AL3/AL4)", f"{high_risk_pct:.1f}%")
-            m4.metric("平均視角信賴度", f"{avg_conf:.1f}%")
-
-        st.info("每個成功樣本輸出 Score A/B/C/D、四種手腕角度、幾何品質註記；並保留原始影格（可選）與關鍵點 JSONL 供追查。單鏡頭角度仍是投影估計，尚未建立人體真實量角準確率。")
-
-        tab_overview, tab_review, tab_hand, tab_report, tab_photos, tab_export = st.tabs(
-            ["📈 風險總覽", "🔍 異常／人工覆核", "🖐️ 手腕比較", "📋 完整報表", "🖼️ 影格照片", "📦 下載"]
-        )
-        with tab_overview:
-            st.subheader("RULA 動作風險時間軸")
-            st.caption("依影片時間呈現每個取樣點的 RULA 最終分數；這是離散姿勢的時間分布，非時間加權暴露量。")
-            if "時間(秒)" in df_show.columns:
-                series = df_show[["時間(秒)", "最終最高分"]].copy().sort_values("時間(秒)")
-                st.line_chart(series.set_index("時間(秒)"), x_label="時間（秒）", y_label="RULA Grand Score")
-            st.caption("平均分數僅供描述性統計；RULA 評估仍需關注高風險姿勢與工作條件。")
-        with tab_review:
-            v4_show_review_center()
-        with tab_hand:
+        mode_now=st.session_state.analyzed_mode
+        df_show=st.session_state.df_records
+        if page == 5:
+            st.subheader('RULA 風險總覽')
+            info=st.session_state.get('skipped_info',{})
+            st.caption(f'評估模式：{mode_now}｜跳過影格仍保留在「被剔除樣本」步驟中。')
+            if df_show is None or df_show.empty:
+                st.warning('沒有共同有效樣本。可在剔除影格頁檢查失敗原因，單側資料可能仍在完整報表中。')
+            else:
+                scores=pd.to_numeric(df_show['最終最高分'],errors='coerce')
+                a,b,c,d=st.columns(4)
+                a.metric('有效樣本數',len(df_show))
+                b.metric('平均 Grand Score',f'{scores.mean():.2f}')
+                c.metric('最高分',int(scores.max()))
+                d.metric('AL3／AL4 比例',f'{(scores.ge(5).mean()*100):.1f}%')
+                series=df_show[['時間(秒)','最終最高分']].copy().sort_values('時間(秒)')
+                st.line_chart(series.set_index('時間(秒)'),x_label='時間（秒）',y_label='RULA Grand Score')
+                if '最危害側' in df_show.columns and mode_now=='左右側同步計算':
+                    st.write('**最危害側統計（含雙側同分）**')
+                    st.dataframe(df_show['最危害側'].value_counts().rename_axis('分類').reset_index(name='筆數'),hide_index=True)
+                st.caption('平均數僅用於描述性統計，正式 RULA 風險仍需關注最危險姿勢與工作條件。')
+            st.info('下一步可看被剔除樣本原圖與局部骨架，再檢查頸部、手腕與人工修正。')
+        elif page == 6:
+            v8_show_rejected_center()
+        elif page == 7:
+            v8_show_neck_center()
+        elif page == 8:
             v6_show_hand_comparison()
-        with tab_report:
-            if mode_now == "左右側同步計算":
-                sub_all, sub_r, sub_l = st.tabs(["雙側對照", "右側完整欄位", "左側完整欄位"])
-                with sub_all:
-                    st.dataframe(df_show, use_container_width=True)
-                with sub_r:
-                    st.dataframe(st.session_state.df_right_only, use_container_width=True)
-                with sub_l:
-                    st.dataframe(st.session_state.df_left_only, use_container_width=True)
+        elif page == 9:
+            v4_show_review_center()
+        elif page == 10:
+            st.subheader('逐影格骨架照片')
+            if mode_now=='左右側同步計算':
+                which=st.radio('選擇側別',['右手側','左手側'],horizontal=True,key='v8_gallery_side')
+                images=st.session_state.display_right_b64 if which=='右手側' else st.session_state.display_left_b64
             else:
-                st.dataframe(df_show, use_container_width=True)
-            st.caption("CSV 同時保留 Pose2D、Pose3D、Pose混合、Hand2D、各部位分數與品質原因。")
-        with tab_photos:
-            st.subheader("逐影格標記照片")
-            if mode_now == "左右側同步計算":
-                gallery_side = st.radio("顯示的拍攝側", ["右手側", "左手側"], horizontal=True, key="v7_gallery_side")
-                images = st.session_state.display_right_b64 if gallery_side == "右手側" else st.session_state.display_left_b64
-            else:
-                images = st.session_state.display_images_b64
+                images=st.session_state.display_images_b64
             if images:
-                selected = st.selectbox("選擇樣本", range(len(images)), format_func=lambda i: images[i][0], key="v7_gallery_pick")
-                caption, payload = images[selected]
+                idx=st.selectbox('選取影格',range(len(images)),format_func=lambda i:images[i][0],key='v8_gallery_select')
                 import html as html_lib
-                components.html(f'<div style="text-align:center;color:#ddd"><img src="data:image/jpeg;base64,{payload}" style="max-width:100%;max-height:750px;border-radius:9px"/><p>{html_lib.escape(caption)}</p></div>', height=790, scrolling=True)
-                if st.checkbox("載入全部照片縮圖（可能增加瀏覽器負擔）", value=False, key="v7_load_all_thumbnails"):
-                    cols = st.columns(3)
-                    for j,(cap_txt,b64_txt) in enumerate(images):
-                        with cols[j % 3]:
-                            components.html(f'<img src="data:image/jpeg;base64,{b64_txt}" style="width:100%;border-radius:5px"/>', height=235)
-                            st.caption(cap_txt)
+                cap,payload=images[idx]
+                components.html(f'<div style="text-align:center"><img src="data:image/jpeg;base64,{payload}" style="max-width:100%;max-height:740px;border-radius:8px"/><p>{html_lib.escape(cap)}</p></div>',height=780,scrolling=True)
+                if st.checkbox('展開所有縮圖（耗用較多記憶體）',key='v8_all_photo_thumbs'):
+                    cols=st.columns(3)
+                    for i,(caption,payload) in enumerate(images):
+                        with cols[i%3]:
+                            components.html(f'<img src="data:image/jpeg;base64,{payload}" style="width:100%"/>',height=240)
+                            st.caption(caption)
             else:
-                st.info("目前沒有可顯示的照片。")
-            st.caption("ZIP 的 Raw_Frames 為未繪製骨架的影格；Diagnostics/Keypoint_Coordinates.jsonl 可對應原始點位。")
-        with tab_export:
-            st.subheader("完整分析與照片匯出")
-            render_blob_download_button(st.session_state.zip_bytes, st.session_state.zip_filename,
-                                        f"📥 下載【{mode_now}】RULA 完整分析 ZIP")
-            st.caption("原始報表、Hand 比較圖、原始影格（若開啟）、關鍵點座標以及跳過樣本均保存在 ZIP。")
-    else:
-        st.warning("⚠️ 影片中未偵測到有效的人體姿態關鍵點，請確認影片人物是否清晰完整。")
+                st.info('沒有可顯示的有效樣本照片。剔除樣本請到第 7 步檢查。')
+        elif page == 11:
+            st.subheader('完整報表與下載')
+            if df_show is not None and not df_show.empty:
+                if mode_now=='左右側同步計算':
+                    table_choice=st.radio('報表類型',['左右共同','右側完整','左側完整'],horizontal=True,key='v8_report_choice')
+                    table={'左右共同':df_show,'右側完整':st.session_state.df_right_only,
+                           '左側完整':st.session_state.df_left_only}[table_choice]
+                    st.dataframe(table,use_container_width=True,hide_index=True)
+                else:
+                    st.dataframe(df_show,use_container_width=True,hide_index=True)
+            else:
+                st.warning('沒有可用的共同有效資料，但仍可下載診斷 ZIP。')
+            if st.session_state.zip_bytes:
+                initial_zip=st.session_state.zip_bytes
+                if st.session_state.v4_overrides:
+                    if mode_now=='左右側同步計算':
+                        source_dfs={'右手側':st.session_state.df_right_only,'左手側':st.session_state.df_left_only}
+                    else:
+                        source_dfs={mode_now:st.session_state.df_records}
+                    anomaly=pd.concat([v4_mark_anomalies(data,side) for side,data in source_dfs.items()
+                                  if data is not None and not data.empty],ignore_index=True)
+                    initial_zip=v4_make_zip(initial_zip,st.session_state.v4_overrides,anomaly)
+                finalized=v8_download_report_zip(initial_zip,st.session_state.get('v8_manual_rejected',{}))
+                render_blob_download_button(finalized,st.session_state.zip_filename,
+                                            f'📥 下載 {mode_now} 完整分析＋失敗影格 ZIP')
+            st.caption('ZIP 包含原始 RULA 報表、被剔除樣本清單與雙照片、頸部候選比較及人工註記，不會覆蓋原始分數。')
+
+# 網頁底部再提供上一頁／下一頁，減少操作時必須向上捲動。
+st.divider()
+bottom_a,bottom_b,bottom_c=st.columns([1,3,1])
+with bottom_a:
+    st.button('← 上一步',disabled=st.session_state.v8_page_index==0,on_click=v8_go,args=(-1,),
+              use_container_width=True,key='v8_prev_bottom')
+with bottom_b:
+    st.caption('頁面跳轉不會自動開始分析；請在第 5 步按啟動按鈕。')
+with bottom_c:
+    st.button('下一步 →',disabled=st.session_state.v8_page_index==len(V8_STEPS)-1,on_click=v8_go,args=(1,),
+              use_container_width=True,key='v8_next_bottom')

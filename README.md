@@ -1,47 +1,78 @@
-# RULA v6：Pose + Hand 實驗版（延續 v5）
+# RULA v8｜逐步導覽＋被剔除影格複核＋頸部候選分析
 
-## 內含檔案
-- `222.py`：可直接作為 Streamlit Cloud Main file 的完整程式。
-- `requirements.txt`：沿用 v5 的套件版本，`mediapipe==0.10.21` 同時支援 Hand Tasks API。
-- `scripts/download_hand_model.py`：可在本機下載官方 Hand Landmarker 模型。
-- `models/README.txt`：模型放置方式與來源。
+## 更新方式
 
-## 建議使用方式
+1. 建議先保留 v7.2 GitHub 備份或建立測試分支。
+2. 將此 ZIP 根目錄的 **`222.py`**、`requirements.txt`、`packages.txt` 上傳至 Streamlit Cloud 專案所使用的 GitHub 儲存庫**根目錄**。
+3. 如已有 `models/hand_landmarker.task`，請繼續保留；沒有的話依 `models/README.txt` 下載官方 `.task` 模型，放入 `models/`。程式另會嘗試下載至可寫入的暫存路徑，但部署端網路可能不可用。
+4. Streamlit Community Cloud 請選 **Python 3.11**；Main file path 為 `222.py`。
+5. 網站頂部應出現 `RULA_V8_WIZARD_REJECT_NECK_2026-10-27`。若仍看到 v7.x，請先確認 GitHub 分支與 Cloud 部署路徑。
 
-請**另建一個 GitHub 儲存庫／Streamlit Cloud 實驗網站**，不要覆蓋 v5 正式版。
+## 新版操作方式
 
-1. 將壓縮檔內容解壓縮（保留 `models/` 和 `scripts/` 子目錄）。
-2. 在電腦可連網的情況下，執行 `python scripts/download_hand_model.py`，會產生 `models/hand_landmarker.task`。
-3. 把 `222.py`、`requirements.txt`、`models/hand_landmarker.task` 上傳新 GitHub 儲存庫，主檔設定為 `222.py`。
-4. Streamlit Cloud 選擇 Python 3.11，等待部署完成。
-5. 上傳正面＋側面影片，選擇 Hand 功能（預設勾選），並保留**安全比較模式**。
-6. 分析後在「手腕演算法比較實驗中心」查看影格、角度、圖片與推論耗時。
+頁面頂部與底部均提供「上一步／下一步」，左側有 **快速跳轉選單**。同一時間只顯示一個主要步驟；設定值存於目前 Streamlit Session State，不會因切換步驟而重置。**重新關閉網站或 Session 失效後，仍需重新上傳影片**（此版本並非永久儲存服務）。
 
-不想自行下載模型也可以：程式會在**第一次分析**時，嘗試從官方來源下載到 `/tmp/rula_hand_assets/hand_landmarker.task`。唯讀的 `site-packages` **不會**被寫入；如網站無法連線，會警告並退回 Pose 模式。
+1. 影片與基本設定
+2. 自動辨識設定（各條件可選擇自動或人工）
+3. 人工條件（腿足支撐、手腕扭轉、受力相關條件）
+4. Hand 實驗設定（預設安全對照模式）
+5. 啟動分析
+6. 風險總覽
+7. 被剔除樣本複核
+8. 頸部品質比較
+9. 手腕演算法比較
+10. 異常與人工修正（含風險時間軸）
+11. 影格照片
+12. 完整報表與 ZIP 下載
 
-## 重要設計
-- **預設安全模式**：只做 Pose/Hand 角度比較，不改動 v5 RULA 評分。
-- **實驗計分模式（須使用者選取）**：匹配目標手腕、Hand/Pose 角度差不超過 35°、腕點距離與前臂長度比不超過 0.32，才會把 Hand 2D 代理角度作為 RULA 手腕屈伸基礎角度，其他情況保留 Pose。
-- 同一張圖的 Pose 肘部與 Hand 腕／掌指點做**影像 2D 座標**角度比較。
-- Hand World 只輸出手掌**局部**幾何（掌心方向長度、掌指張角）；**沒有**和 Pose World 的 3D 點相減，**沒有**宣稱量得前臂旋前旋後。
-- 匯出 ZIP 包含 `Hand_Comparison/Comparison_Data.csv` 以及每張的 `Pose` / `PoseHand` 影像對照。原本 RULA CSV、異常影格審核、逐影格重算、時間軸功能保留。
-- 分析畫面可比較 `Pose 側面偵測耗時(ms)` 與 `Hand 偵測耗時(ms)`；兩者的測量範圍不同，不代表完整網站前後總耗時可直接相減。
-- **資料仍須研究驗證**：Hand 匹配成功率、模型間一致性並非量測準確率。保持與 v5 輸出對照，不要將模型輸出當作真值。
+## v8 新功能與可驗收項目
 
-## 本機安裝
+### 1. 被剔除樣本複核
 
-```bash
-python -m pip install -r requirements.txt
-python scripts/download_hand_model.py
-streamlit run 222.py
-```
+- 只顯示自動分析跳過的**樣本＋側別**，而不是只記錄失敗數量。
+- 每筆可以選擇正面、右側或左側**實際有影格的鏡頭**；左圖為原始未渲染 JPEG；右圖為同一影格再次執行 MediaPipe 後，**僅畫出可見度達到門檻的實際關鍵點**。完全未偵測到則不憑空繪製骨架。
+- 可以標記「尚未複核」、「需要人工量測」、「照片可辨識但不恢復自動評分」、「確認無法辨識」。標記不會改變原始 RULA 分數。
+- `Diagnostics/Rejected_Samples_Detail.csv` 包含樣本編號／時間／側別／原因及圖片相對路徑；`Diagnostics/Rejected_Images/` 保存原圖與診斷圖；下載時另存 `Diagnostics/Rejected_Manual_Reviews.csv`。
+- **注意：右圖是事後使用相同影格重跑模型的診斷嘗試，可能不完全等於原始分析當下的內部結果**；因此保留拒絕原因，不因第二次偵測成功就自動恢復該分數。
 
-## 依賴與模型
-Google 官方文件：https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker/python
-模型檔：https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+### 2. 頸部估測／跨鏡頭品質對照
 
-## 若 Hand 偵測不到
-先確認模型檔、拍攝距離、手是否被物品遮住、畫面解析度及鏡頭是否接近側面。Hand 模型未必能改善第 9 筆等遮擋嚴重的樣本；仍以樣本比較與後續小規模參考測量為準。
+- 原本 v7 頸角保持不變（正式 RULA 評分沿用原值）。
+- 另加入 v8 頸部相對軀幹的 2D 候選角、關鍵點來源與最低可見度品質指標。
+- 左右兩鏡頭：只有雙方品質達標，且候選角差異不大時才建立**診斷用**加權融合候選值；差異太大或品質不足時顯示不融合原因。
+- 會輸出 `Diagnostics/Neck_Comparison.csv` 與逐側報表欄位；角度更接近不代表人體真實量測更準確。
+- 原始的雙側彙總頸角仍保留為舊版展示值，不參與重新推算每側 RULA。
 
-## 尚未測試範圍
-程式已做語法檢查與模擬單元測試，但環境未提供 Mediapipe、Streamlit 和可下載的 `.task` 二進位模型，因此沒有完成真正 Streamlit Cloud／實際影片端到端驗證。
+### 3. Hand 診斷與原有功能
+
+- 保留原有 Pose 2D / Pose 3D / Pose 混合 / Hand 2D 的同影格比較及雙照片。
+- 新增 Hand 品質失敗原因統計，幫助追查左手偵測問題；**沒有提升模型匹配率的未經驗證宣稱**。
+- 保留保守異常樣本警示、逐影格部位分數人工覆寫與重算、風險時間軸、左右側同步評分、原始圖片與關鍵點 JSONL 匯出。
+- 左右分數相同時彙總表改顯示**「雙側同分」**，不再硬指定右側。
+
+## ZIP 重要檔案
+
+- `RULA_左右同步彙整報表.csv`、`RULA_右手側獨立報表.csv`、`RULA_左手側獨立報表.csv` 或 `RULA_Report.csv`
+- `Diagnostics/Skipped_Samples.csv`
+- `Diagnostics/Rejected_Samples_Detail.csv`
+- `Diagnostics/Rejected_Images/`（圖片原圖＋實際重新推論的診斷圖）
+- `Diagnostics/Rejected_Manual_Reviews.csv`（從最後一步下載的完整 ZIP）
+- `Diagnostics/Neck_Comparison.csv`（雙側模式）
+- `Diagnostics/Keypoint_Coordinates.jsonl`、`Raw_Frames/`（勾選匯出時）
+- `Hand_Comparison/Comparison_Data.csv`
+- 完整報表在有人工修正時，另外包含 `Diagnostics/V4_Manual_Overrides.csv` 等紀錄。
+
+## 此版本做了哪些測試？
+
+- `python -m py_compile` 語法檢查。
+- 使用假的 MediaPipe 模型與合成 MP4 影片做**雙側、單側流程的離線模擬**：含成功樣本、剔除影格、照片／CSV／ZIP 對應及左右同分。
+- 使用假的 Streamlit UI 跑過 12 個主步驟及分析後結果頁。
+- 測試頸部候選融合：品質不足、左右差距太大時不融合；測試下載 ZIP 不覆蓋原始分數。
+- **尚未在使用者實際的 Streamlit Cloud 與真實影片做端到端執行**。離線合成測試不代表角度真值、AI 辨識率或臨床／職業衛生評估準確性。
+- Table A/B/C 沿用 v7.2，**尚未完成與官方 RULA 工作表逐格獨立核對**，專題正式驗證前仍應補做。
+
+## 若部署出錯
+
+- 嚴格使用 Python **3.11**，不要直接升級 MediaPipe 到 0.10.30+ 而未改寫 Pose Legacy API。
+- OpenCV 載入失敗需確認 `packages.txt` 的 `libgl1`、`libglib2.0-0` 是否安裝成功；請提供 Cloud Logs 的最後一行 ImportError。
+- 如果出現 `NameError`，先確認首頁版本標記與 GitHub `222.py` 是否一致。
